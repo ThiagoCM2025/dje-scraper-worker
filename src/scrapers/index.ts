@@ -1,16 +1,16 @@
-import type { Browser } from 'playwright';
-import type { ScrapingJob, Publication, TribunalScraper } from '../types.js';
-import { scrapeTjsp } from './tjsp-playwright.js';
+import { Publication } from '../types';
+import { scrapeTJSP } from './tjsp-playwright';
 
-export function getScraperForJob(job: ScrapingJob): TribunalScraper {
-  const tribunal = job.tribunal?.toUpperCase();
+export interface Scraper {
+  scrape(oabNumber: string, searchDate: string): Promise<Publication[]>;
+}
 
-  if (tribunal === 'TJSP') {
-    return scrapeTjsp;
+export function getScraperForTribunal(tribunal: string): Scraper | null {
+  switch (tribunal.toUpperCase()) {
+    case 'TJSP':
+      return { scrape: scrapeTJSP };
+    default:
+      console.warn(`⚠️ Scraper não implementado para tribunal: ${tribunal}`);
+      return null;
   }
-
-  // Fallback: lança erro claro se não houver scraper
-  return async (_browser: Browser, _job: ScrapingJob): Promise<Publication[]> => {
-    throw new Error(`Não há scraper configurado para o tribunal: ${job.tribunal}`);
-  };
 }
