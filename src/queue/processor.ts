@@ -8,91 +8,103 @@ const supabase = createClient(
 );
 
 export async function processQueue() {
-  console.log(`\n⏰ [${new Date().toISOString()}] Verificando fila...`);
+  console.log('[QUEUE] 📋 Buscando jobs pending...');
 
-  try {
-    // Buscar jobs pendentes
-    const { data: jobs, error } = await supabase
-      .from('dje_scraping_queue')
-      .select('*')
-      .eq('status', 'pending')
-      .order('created_at', { ascending: true })
-      .limit(5);
+  // Buscar jobs pendentes
+  const { data: jobs, error } = await supabase
+    .from('dje_scraping_queue')
+    .select('*')
+    .eq('status', 'pending')
+    .lt('retry_count', 3)  // ✅ CORRIGIDO: era attempt_count
+    .order('created_at', { ascending: true })
+    .limit(5);
 
-    if (error) {
-      console.error('❌ Erro ao buscar jobs:', error);
-      return;
-    }
-
-    if (!jobs || jobs.length === 0) {
-      console.log('📭 Nenhum job pendente');
-      return;
-    }
-
-    console.log(`📋 ${jobs.length} job(s) encontrado(s)`);
-
-    for (const job of jobs) {
-      await processJob(job);
-    }
-  } catch (err) {
-    console.error('❌ Erro no processamento:', err);
+  if (error) {
+    console.error('[QUEUE] ❌ Erro ao buscar jobs:', error);
+    return;
   }
-}
 
-async function processJob(job: any) {
-  console.log(`\n🔄 Processando job ${job.id}...`);
-  console.log(`   OAB: ${job.oab_number}/${job.oab_state}`);
+  if (!jobs?.length) {
+    console.log('[QUEUE] ⚠️ Nenhum job para processar');
+    return;
+  }
 
-  try {
-    // Atualizar status para processing
-    await supabase
-      .from('dje_scraping_queue')
-      .update({ 
-        status: 'processing',
-        started_at: new Date().toISOString()
-      })
-      .eq('id', job.id);
+  console.log(`[QUEUE] ✅ ${jobs.length} jobs encontrados`);
 
-    // Executar scraping
-    const result = await scrapeTJSP({
-      oabNumber: job.oab_number,
-      oabState: job.oab_state,
-      startDate: job.start_date,
-      endDate: job.end_date
-    });
+  // Processar cada job
+  for (const job of jobs) {
+    try {
+      console.log(`[QUEUE] 🔄 Processando job ${job.id}`);
+      console.log(`[QUEUE] 📍 Tribunal: ${job.tribunal}, OAB: ${job.oab_number}, Data: ${job.target_date}`);
 
-    console.log(`📊 Resultado: ${result.publications.length} publicações`);
+      // Marcar como processing
+      await supabase
+        .from('dje_scraping_queue')
+        .update({
+          status: 'processing',
+          started_at: new Date().toISOString(),
+          retry_count: (job.retry_count || 0) + 1  // ✅ CORRIGIDO: era attempt_count
+        })
+        .eq('id', job.id);
 
-    // Enviar para webhook
-    await sendWebhook({
-      jobId: job.id,
-      visitorId: job.visitor_id,
-      visitorType: job.visitor_type,
-      ...result
-    });
+      // Executar scraping baseado no tribunal
+      let publications: any[] = [];
+      
+      const tribunal = job.tribunal?.toUpperCase();
+      console.log(`[QUEUE] 🔍 Iniciando scraping para ${tribunal}...`);
+      
+      if (tribunal === 'TJSP' || tribunal === 'SP') {
+        publications = await scrapeTJSP(
+          job.oab_number, 
+          job.oab_state || 'SP',
+          job.lawyer_name,
+          job.target_date
+        );
+      } else {
+        console.log(`[QUEUE] ⚠️ Tribunal ${tribunal} não suportado ainda`);
+      }
 
-    // Atualizar status para completed
-    await supabase
-      .from('dje_scraping_queue')
-      .update({
+      // Atualizar job como completed
+      await supabase
+        .from('dje_scraping_queue')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          publications_found: publications.length
+        })
+        .eq('id', job.id);
+
+      // Enviar resultados via webhook
+      await sendWebhook({
+        jobId: job.id,
         status: 'completed',
-        completed_at: new Date().toISOString(),
-        result: result
-      })
-      .eq('id', job.id);
+        publications,
+        resultsCount: publications.length
+      });
 
-    console.log(`✅ Job ${job.id} concluído`);
+      console.log(`[QUEUE] ✅ Job ${job.id} concluído - ${publications.length} publicações`);
 
-  } catch (err: any) {
-    console.error(`❌ Erro no job ${job.id}:`, err.message);
+    } catch (error: any) {
+      console.error(`[QUEUE] ❌ Erro no job ${job.id}:`, error);
 
-    await supabase
-      .from('dje_scraping_queue')
-      .update({
+      // Atualizar job como failed
+      await supabase
+        .from('dje_scraping_queue')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          error_message: error?.message || 'Erro desconhecido'
+        })
+        .eq('id', job.id);
+
+      // Enviar erro via webhook
+      await sendWebhook({
+        jobId: job.id,
         status: 'failed',
-        error_message: err.message,
-        completed_at: new Date().toISOString()
-      })
-      .eq('id', job.id);
+        error: error?.message || 'Erro desconhecido'
+      });
+    }
   }
+
+  console.log('[QUEUE] 🏁 Processamento da fila finalizado');
 }
