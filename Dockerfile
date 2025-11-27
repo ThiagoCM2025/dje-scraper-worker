@@ -1,10 +1,12 @@
-FROM mcr.microsoft.com/playwright:v1.40.0-jammy
+FROM mcr.microsoft.com/playwright:v1.55.1-jammy
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json package-lock.json* ./
 RUN npm install
 
 COPY . .
 
-CMD ["npm", "start"]
+RUN npm run build
+
+CMD ["node", "dist/index.js"]
