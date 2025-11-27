@@ -1,55 +1,40 @@
 import { createClient } from '@supabase/supabase-js';
-import { processQueue } from './queue/processor';
+import { processQueue } from './queue/processor.js';
 
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+// Configuração do Supabase
+const supabaseUrl = process.env.SUPABASE_URL!;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-// Intervalo de execução: 5 minutos
-const INTERVAL_MS = 5 * 60 * 1000;
+export const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ✅ Inicializar Supabase SEM tipagem forte e SEM pacote "cron"
-export const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+// Intervalo de polling em ms (5 minutos)
+const POLL_INTERVAL = 5 * 60 * 1000;
 
-console.log('🚀 DJE Worker iniciado');
-console.log('📡 Conectando ao Supabase...');
-console.log(`⏰ Configurando loop a cada ${INTERVAL_MS / 60000} minutos (setInterval)`);
+async function main() {
+  console.log('🚀 DJE Worker iniciado');
+  console.log(`📡 Conectado ao Supabase: ${supabaseUrl}`);
+  console.log(`⏱️ Intervalo de polling: ${POLL_INTERVAL / 1000}s`);
 
-let isShuttingDown = false;
+  // Executar imediatamente na inicialização
+  await runProcessQueue();
 
-async function runCycle() {
-  if (isShuttingDown) {
-    console.log('⏹️ Worker em desligamento, ignorando novo ciclo.');
-    return;
-  }
+  // Configurar intervalo para polling contínuo
+  setInterval(runProcessQueue, POLL_INTERVAL);
 
-  console.log('\n⏰ [LOOP] Executando verificação da fila...');
+  console.log('✅ Worker rodando. Aguardando jobs...');
+}
+
+async function runProcessQueue() {
   try {
+    console.log(`\n[${new Date().toISOString()}] 🔍 Verificando fila de jobs...`);
     await processQueue();
-    console.log('✅ [LOOP] Fila processada com sucesso');
   } catch (error) {
-    console.error('❌ [LOOP] Erro ao processar fila:', error);
+    console.error('❌ Erro no processamento da fila:', error);
   }
 }
 
-// Executa uma vez na subida
-runCycle();
-
-// Agenda execução recorrente a cada 5 minutos
-const intervalId = setInterval(runCycle, INTERVAL_MS);
-
-console.log('✅ Worker em execução. Aguardando jobs...');
-
-// Tratamento de encerramento gracioso
-function shutdown(signal: string) {
-  console.log(`🛑 Sinal ${signal} recebido, encerrando worker...`);
-  isShuttingDown = true;
-  clearInterval(intervalId);
-  // Pequeno delay opcional para terminar ciclos em andamento
-  setTimeout(() => {
-    console.log('👋 Worker finalizado com segurança.');
-    process.exit(0);
-  }, 2000);
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Iniciar worker
+main().catch((error) => {
+  console.error('💀 Erro fatal ao iniciar worker:', error);
+  process.exit(1);
+});
