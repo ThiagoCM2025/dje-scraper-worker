@@ -1,5 +1,5 @@
-const cron = require('node-cron');
-const { processQueue } = require('./queue/processor');
+import cron from 'node-cron';
+import { processQueue } from './queue/processor';
 
 console.log('🚀 DJE Railway Worker v2.0 (Edge Function Mode)');
 console.log('📡 Conectando via Edge Functions...');
