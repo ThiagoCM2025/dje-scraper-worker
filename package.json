@@ -1,21 +1,20 @@
 {
   "name": "dje-scraper-worker",
   "version": "1.0.0",
+  "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --loader ts-node/esm src/index.ts"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "playwright": "^1.40.0"
+    "@supabase/supabase-js": "^2.58.0",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.55.1"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
-    "tsx": "^4.7.0",
-    "typescript": "^5.3.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
   }
 }
