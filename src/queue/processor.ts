@@ -1,125 +1,115 @@
-import { supabase } from '../index';
-import { ScrapingJob, Publication } from '../types';
-import { getScraperForTribunal } from '../scrapers';
-import { sendWebhook } from '../webhook/sender';
+import { createClient } from '@supabase/supabase-js';
+import { ScrapingJob, Publication } from '../types.js';
+import { sendWebhook } from '../webhook/sender.js';
+import { getScraperForTribunal } from '../scrapers/index.js';
 
-export async function processQueue() {
-  console.log('🔍 Buscando jobs pendentes...');
+const supabaseUrl = process.env.SUPABASE_URL!;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-  try {
-    const { data: jobs, error } = await supabase
-      .from('dje_scraping_queue')
-      .select('*')
-      .eq('status', 'pending')
-      .lt('attempts', 3)
-      .order('priority', { ascending: false })
-      .order('created_at', { ascending: true })
-      .limit(5);
+export async function processQueue(): Promise<void> {
+  // Buscar próximo job pendente
+  const { data: jobs, error } = await supabase
+    .from('dje_scraping_queue')
+    .select('*')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true })
+    .limit(1);
 
-    if (error) {
-      console.error('❌ Erro ao buscar jobs:', error);
-      return;
-    }
-
-    if (!jobs || jobs.length === 0) {
-      console.log('ℹ️ Nenhum job pendente encontrado.');
-      return;
-    }
-
-    console.log(`📋 Encontrados ${jobs.length} jobs para processar`);
-
-    await Promise.allSettled(jobs.map(job => processJob(job as ScrapingJob)));
-
-  } catch (error) {
-    console.error('❌ Erro fatal ao processar fila:', error);
+  if (error) {
+    console.error('Erro ao buscar jobs:', error);
+    return;
   }
-}
 
-async function processJob(job: ScrapingJob) {
-  console.log(`\n🔄 Processando job ${job.id}`);
-  console.log(`   Tribunal: ${job.tribunal}`);
-  console.log(`   OAB: ${job.oab_number}`);
-  console.log(`   Data: ${job.search_date}`);
+  if (!jobs || jobs.length === 0) {
+    console.log('Nenhum job pendente na fila');
+    return;
+  }
+
+  const job = jobs[0] as ScrapingJob;
+  console.log(`📋 Processando job ${job.id} - ${job.tribunal} - OAB ${job.oab_number}/${job.oab_state}`);
 
   try {
-    const { error: updateError } = await supabase
+    // Marcar como processando
+    await supabase
       .from('dje_scraping_queue')
-      .update({
-        status: 'processing',
-        started_at: new Date().toISOString(),
-        attempts: job.attempts + 1,
-        updated_at: new Date().toISOString()
+      .update({ 
+        status: 'processing', 
+        started_at: new Date().toISOString() 
       })
       .eq('id', job.id);
 
-    if (updateError) {
-      console.error(`❌ Erro ao atualizar job ${job.id}:`, updateError);
-      return;
-    }
-
-    console.log(`✅ Job ${job.id} marcado como processing`);
-
+    // Obter scraper apropriado
     const scraper = getScraperForTribunal(job.tribunal);
     
-    if (!scraper) {
-      throw new Error(`Scraper não encontrado para tribunal: ${job.tribunal}`);
+    // Executar scraping
+    const publications = await scraper.scrape({
+      oabNumber: job.oab_number,
+      oabState: job.oab_state,
+      searchDate: job.search_date,
+    });
+
+    console.log(`✅ Encontradas ${publications.length} publicações`);
+
+    // Salvar publicações no banco
+    if (publications.length > 0) {
+      const publicationsToInsert = publications.map((pub: Publication) => ({
+        ...pub,
+        monitoring_id: job.monitoring_id,
+        job_id: job.id,
+        tribunal: job.tribunal,
+      }));
+
+      const { error: insertError } = await supabase
+        .from('dje_publications')
+        .insert(publicationsToInsert);
+
+      if (insertError) {
+        console.error('Erro ao salvar publicações:', insertError);
+      }
     }
 
-    console.log(`🤖 Executando scraping para ${job.tribunal}...`);
-    const publications = await scraper.scrape(job.oab_number, job.search_date);
-    
-    console.log(`📊 Publicações encontradas: ${publications.length}`);
-
-    const { error: completeError } = await supabase
+    // Marcar job como concluído
+    await supabase
       .from('dje_scraping_queue')
       .update({
         status: 'completed',
         completed_at: new Date().toISOString(),
-        result: { publications_count: publications.length },
-        updated_at: new Date().toISOString()
+        publications_found: publications.length,
       })
       .eq('id', job.id);
 
-    if (completeError) {
-      console.error(`❌ Erro ao completar job ${job.id}:`, completeError);
-    }
-
+    // Enviar webhook de sucesso
     await sendWebhook({
+      event: 'job.completed',
       job_id: job.id,
-      status: 'completed',
+      monitoring_id: job.monitoring_id,
       tribunal: job.tribunal,
-      oab_number: job.oab_number,
-      search_date: job.search_date,
       publications,
-      processed_at: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
 
-    console.log(`✅ Job ${job.id} concluído com sucesso`);
-
-  } catch (error) {
+  } catch (error: any) {
     console.error(`❌ Erro ao processar job ${job.id}:`, error);
 
-    const { error: failError } = await supabase
+    // Marcar job como falhou
+    await supabase
       .from('dje_scraping_queue')
       .update({
         status: 'failed',
-        error_message: error instanceof Error ? error.message : 'Erro desconhecido',
-        updated_at: new Date().toISOString()
+        completed_at: new Date().toISOString(),
+        error_message: error.message || 'Erro desconhecido',
       })
       .eq('id', job.id);
 
-    if (failError) {
-      console.error(`❌ Erro ao marcar job ${job.id} como failed:`, failError);
-    }
-
+    // Enviar webhook de erro
     await sendWebhook({
+      event: 'job.failed',
       job_id: job.id,
-      status: 'failed',
+      monitoring_id: job.monitoring_id,
       tribunal: job.tribunal,
-      oab_number: job.oab_number,
-      search_date: job.search_date,
-      error: error instanceof Error ? error.message : 'Erro desconhecido',
-      processed_at: new Date().toISOString()
+      error: error.message,
+      timestamp: new Date().toISOString(),
     });
   }
 }
