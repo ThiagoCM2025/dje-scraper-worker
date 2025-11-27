@@ -1,9 +1,32 @@
-const { scrapeTJSP } = require('../scrapers/tjsp');
+import { scrapeTJSP } from '../scrapers/tjsp-playwright';
 
-const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL || '';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
-async function processQueue() {
+interface ScrapingJob {
+  id: string;
+  oab_number: string;
+  oab_state: string;
+  tribunal: string;
+  target_date: string;
+  status: string;
+  priority: number;
+}
+
+interface Publication {
+  text: string;
+  date: string;
+  type?: string;
+  processNumber?: string;
+}
+
+interface GetJobsResponse {
+  jobs: ScrapingJob[];
+  count: number;
+  message?: string;
+}
+
+export async function processQueue(): Promise<void> {
   console.log('[QUEUE] Buscando jobs pendentes via Edge Function...');
 
   if (!SUPABASE_PROJECT_URL || !WEBHOOK_SECRET) {
@@ -31,7 +54,8 @@ async function processQueue() {
       throw new Error(`Erro ao buscar jobs: ${response.status} - ${errorText}`);
     }
 
-    const { jobs, count } = await response.json();
+    const data: GetJobsResponse = await response.json();
+    const { jobs, count } = data;
     console.log(`[QUEUE] ✅ ${count || 0} jobs encontrados`);
 
     if (!jobs || jobs.length === 0) {
@@ -49,25 +73,33 @@ async function processQueue() {
       try {
         // Fazer scraping
         const result = await scrapeTJSP(job.oab_number, job.oab_state, job.target_date);
+        const publications = result.publications || [];
         
         // Enviar resultado para webhook
-        await sendResult(job.id, 'completed', result.publications || []);
-        console.log(`[QUEUE] ✅ Job ${job.id} completado: ${(result.publications || []).length} publicações`);
+        await sendResult(job.id, 'completed', publications);
+        console.log(`[QUEUE] ✅ Job ${job.id} completado: ${publications.length} publicações`);
         
-      } catch (error) {
-        console.error(`[QUEUE] ❌ Erro no job ${job.id}:`, error.message);
-        await sendResult(job.id, 'failed', [], error.message);
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[QUEUE] ❌ Erro no job ${job.id}:`, errorMessage);
+        await sendResult(job.id, 'failed', [], errorMessage);
       }
     }
 
     console.log('[QUEUE] ✅ Ciclo de processamento concluído');
 
-  } catch (error) {
-    console.error('[QUEUE] ❌ Erro fatal:', error.message);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+    console.error('[QUEUE] ❌ Erro fatal:', errorMessage);
   }
 }
 
-async function sendResult(jobId, status, publications = [], error = null) {
+async function sendResult(
+  jobId: string, 
+  status: string, 
+  publications: Publication[] = [], 
+  error: string | null = null
+): Promise<void> {
   const webhookUrl = `${SUPABASE_PROJECT_URL}/functions/v1/dje-webhook-receiver`;
   console.log(`[WEBHOOK] Enviando resultado para: ${webhookUrl}`);
   
@@ -93,5 +125,3 @@ async function sendResult(jobId, status, publications = [], error = null) {
   
   console.log(`[WEBHOOK] ✅ Resultado enviado com sucesso`);
 }
-
-module.exports = { processQueue };
