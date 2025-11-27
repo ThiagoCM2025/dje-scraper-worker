@@ -1,40 +1,13 @@
-import { scrapeTJSP } from '../scrapers/tjsp-playwright';
+// src/queue/processor.ts
+import { ScrapingJob, Publication, GetJobsResponse } from '../types';
+import { getScraperForTribunal } from '../scrapers';
+import { sendResult } from '../webhook/sender';
 
-const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL || '';
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
-
-interface ScrapingJob {
-  id: string;
-  oab_number: string;
-  oab_state: string;
-  tribunal: string;
-  target_date: string;
-  status: string;
-  priority: number;
-}
-
-interface Publication {
-  text: string;
-  date: string;
-  type?: string;
-  processNumber?: string;
-}
-
-interface GetJobsResponse {
-  jobs: ScrapingJob[];
-  count: number;
-  message?: string;
-}
+const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL!;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET!;
 
 export async function processQueue(): Promise<void> {
   console.log('[QUEUE] Buscando jobs pendentes via Edge Function...');
-
-  if (!SUPABASE_PROJECT_URL || !WEBHOOK_SECRET) {
-    console.error('[QUEUE] ❌ Variáveis de ambiente não configuradas!');
-    console.error('  - SUPABASE_PROJECT_URL:', SUPABASE_PROJECT_URL ? '✓' : '✗');
-    console.error('  - WEBHOOK_SECRET:', WEBHOOK_SECRET ? '✓' : '✗');
-    return;
-  }
 
   try {
     // 1. Buscar jobs pendentes via Edge Function
@@ -55,73 +28,56 @@ export async function processQueue(): Promise<void> {
     }
 
     const data: GetJobsResponse = await response.json();
-    const { jobs, count } = data;
-    console.log(`[QUEUE] ✅ ${count || 0} jobs encontrados`);
+    console.log(`[QUEUE] ✅ ${data.count || 0} jobs encontrados`);
 
-    if (!jobs || jobs.length === 0) {
+    if (!data.jobs || data.jobs.length === 0) {
       console.log('[QUEUE] Nenhum job pendente. Aguardando próximo ciclo...');
       return;
     }
 
     // 2. Processar cada job
-    for (const job of jobs) {
-      console.log(`[QUEUE] 🔄 Processando job ${job.id}`);
-      console.log(`  - OAB: ${job.oab_number}/${job.oab_state}`);
-      console.log(`  - Tribunal: ${job.tribunal}`);
-      console.log(`  - Data: ${job.target_date}`);
-      
-      try {
-        // Fazer scraping
-        const result = await scrapeTJSP(job.oab_number, job.oab_state, job.target_date);
-        const publications = result.publications || [];
-        
-        // Enviar resultado para webhook
-        await sendResult(job.id, 'completed', publications);
-        console.log(`[QUEUE] ✅ Job ${job.id} completado: ${publications.length} publicações`);
-        
-      } catch (err: unknown) {
-        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-        console.error(`[QUEUE] ❌ Erro no job ${job.id}:`, errorMessage);
-        await sendResult(job.id, 'failed', [], errorMessage);
-      }
+    for (const job of data.jobs) {
+      await processJob(job);
     }
 
     console.log('[QUEUE] ✅ Ciclo de processamento concluído');
 
-  } catch (err: unknown) {
-    const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Erro desconhecido';
     console.error('[QUEUE] ❌ Erro fatal:', errorMessage);
   }
 }
 
-async function sendResult(
-  jobId: string, 
-  status: string, 
-  publications: Publication[] = [], 
-  error: string | null = null
-): Promise<void> {
-  const webhookUrl = `${SUPABASE_PROJECT_URL}/functions/v1/dje-webhook-receiver`;
-  console.log(`[WEBHOOK] Enviando resultado para: ${webhookUrl}`);
+async function processJob(job: ScrapingJob): Promise<void> {
+  console.log(`[QUEUE] 🔄 Processando job ${job.id}`);
+  console.log(`   - OAB: ${job.oab_number}/${job.oab_state}`);
+  console.log(`   - Tribunal: ${job.tribunal}`);
+  console.log(`   - Data: ${job.target_date}`);
   
-  const response = await fetch(webhookUrl, {
-    method: 'POST',
-    headers: {
-      'x-webhook-secret': WEBHOOK_SECRET,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      jobId,
-      status,
-      publications,
-      error,
-      resultsCount: publications.length
-    })
-  });
+  const startTime = Date.now();
+  
+  try {
+    // Obter scraper para o tribunal
+    const scraper = getScraperForTribunal(job.tribunal);
+    
+    if (!scraper) {
+      throw new Error(`Scraper não encontrado para tribunal: ${job.tribunal}`);
+    }
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Erro ao enviar resultado: ${response.status} - ${errorText}`);
+    // Fazer scraping
+    const result = await scraper.scrape(job.oab_number, job.oab_state, job.target_date);
+    const publications = result.publications || [];
+    
+    const processingTime = Date.now() - startTime;
+    console.log(`[QUEUE] ✅ Scraping concluído em ${processingTime}ms: ${publications.length} publicações`);
+    
+    // Enviar resultado para webhook
+    await sendResult(job.id, 'completed', publications);
+    console.log(`[QUEUE] ✅ Job ${job.id} completado com sucesso`);
+    
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Erro desconhecido';
+    console.error(`[QUEUE] ❌ Erro no job ${job.id}:`, errorMessage);
+    await sendResult(job.id, 'failed', [], errorMessage);
   }
-  
-  console.log(`[WEBHOOK] ✅ Resultado enviado com sucesso`);
 }
