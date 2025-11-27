@@ -1,30 +1,67 @@
-import { chromium } from 'playwright';
-import { Publication } from '../types.js';
+import { chromium, Browser, Page } from 'playwright';
 
-export async function scrapeTJSP(params: {
-  oabNumber: string;
-  oabState: string;
-  searchDate: string;
-}): Promise<Publication[]> {
-  console.log(`🔍 Iniciando scraping TJSP para OAB ${params.oabNumber}/${params.oabState}`);
+interface Publication {
+  text: string;
+  date: string;
+  type?: string;
+  processNumber?: string;
+}
 
-  // Por enquanto, retornar dados de teste para validar o fluxo
-  // TODO: Implementar scraping real com Playwright
+interface ScrapingResult {
+  success: boolean;
+  publications: Publication[];
+  error?: string;
+}
+
+export async function scrapeTJSP(
+  oabNumber: string, 
+  oabState: string, 
+  targetDate: string
+): Promise<ScrapingResult> {
+  console.log(`[TJSP] Iniciando scraping para OAB ${oabNumber}/${oabState} em ${targetDate}`);
   
-  const testPublications: Publication[] = [
-    {
-      monitoring_id: '',  // Será preenchido pelo processor
-      job_id: '',         // Será preenchido pelo processor
-      tribunal: 'TJSP',
-      publish_date: params.searchDate,
-      content: `[TESTE] Publicação de teste para OAB ${params.oabNumber}/${params.oabState} - ${new Date().toISOString()}`,
-      case_number: '1234567-89.2024.8.26.0000',
-      journal_type: 'Caderno 1 - Judicial - Capital',
-      journal_edition: 'Edição ' + Math.floor(Math.random() * 1000),
+  let browser: Browser | null = null;
+  
+  try {
+    browser = await chromium.launch({ 
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const page: Page = await browser.newPage();
+    
+    // TODO: Implementar lógica real de scraping do TJSP
+    // Por enquanto, retorna dados de teste
+    console.log('[TJSP] ⚠️ Usando dados de teste (scraping real não implementado)');
+    
+    const testPublications: Publication[] = [
+      {
+        text: `[TESTE] Publicação para OAB ${oabNumber}/${oabState} - ${targetDate}`,
+        date: targetDate,
+        type: 'intimacao',
+        processNumber: '0000000-00.0000.0.00.0000'
+      }
+    ];
+    
+    await browser.close();
+    
+    return {
+      success: true,
+      publications: testPublications
+    };
+    
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+    console.error('[TJSP] Erro no scraping:', errorMessage);
+    
+    if (browser) {
+      await browser.close();
     }
-  ];
-
-  console.log(`✅ Scraping TJSP concluído: ${testPublications.length} publicação(ões) encontrada(s)`);
-  
-  return testPublications;
+    
+    return {
+      success: false,
+      publications: [],
+      error: errorMessage
+    };
+  }
 }
