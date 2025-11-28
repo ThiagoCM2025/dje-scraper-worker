@@ -1,23 +1,18 @@
-// src/scrapers/index.ts
 import { ScrapingResult } from '../types';
 import { scrapeTJSP } from './tjsp';
 
-export interface Scraper {
-  scrape(oabNumber: string, oabState: string, targetDate: string): Promise<ScrapingResult>;
-}
+export type ScraperFunction = (
+  oabNumber: string,
+  oabState: string,
+  targetDate: string
+) => Promise<ScrapingResult>;
 
-export function getScraperForTribunal(tribunal: string): Scraper | null {
-  const tribunalUpper = tribunal.toUpperCase();
-  
-  switch (tribunalUpper) {
+export function getScraperForTribunal(tribunal: string): ScraperFunction {
+  switch (tribunal.toUpperCase()) {
     case 'TJSP':
-      return { scrape: scrapeTJSP };
-    case 'TJRJ':
-      // TODO: Implementar scraper TJRJ
-      console.warn(`⚠️ Scraper TJRJ não implementado ainda`);
-      return { scrape: scrapeTJSP }; // Fallback temporário
+      return scrapeTJSP;
     default:
-      console.warn(`⚠️ Scraper não implementado para tribunal: ${tribunal}`);
-      return null;
+      console.log(`[SCRAPERS] No specific scraper for ${tribunal}, using TJSP`);
+      return scrapeTJSP;
   }
 }
