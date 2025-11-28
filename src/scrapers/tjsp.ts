@@ -1,5 +1,4 @@
-// src/scrapers/tjsp.ts
-import { chromium, Browser } from 'playwright';
+import { chromium } from 'playwright';
 import { Publication, ScrapingResult } from '../types';
 
 export async function scrapeTJSP(
@@ -7,83 +6,50 @@ export async function scrapeTJSP(
   oabState: string,
   targetDate: string
 ): Promise<ScrapingResult> {
-  console.log(`[TJSP] 🔍 Iniciando scraping para OAB ${oabNumber}/${oabState} na data ${targetDate}`);
-  
-  const startTime = Date.now();
-  
-  // 🚧 IMPLEMENTAÇÃO TEMPORÁRIA - Retornando dados de teste
-  // TODO: Implementar scraping real com Playwright
-  
-  console.log('[TJSP] ⚠️ Usando dados de teste (implementação completa em desenvolvimento)');
-  
-  const testPublications: Publication[] = [
-    {
-      processo_numero: '1234567-89.2024.8.26.0000',
-      processo_partes: 'Autor X vs Réu Y',
-      intimacao_texto: `Intima-se o advogado OAB ${oabNumber}/${oabState} para apresentar contestação no prazo de 15 dias.`,
-      publicacao_data: targetDate,
-      tipo_publicacao: 'intimacao',
-      prazo_dias: 15,
-      raw_text: `[DJE TJSP ${targetDate}] Processo: 1234567-89.2024.8.26.0000 - Intimação para advogado OAB ${oabNumber}/${oabState}`,
-      page_number: 42,
-      section: 'Judicial - 1ª Instância'
-    },
-    {
-      processo_numero: '9876543-21.2024.8.26.0001',
-      processo_partes: 'Requerente A vs Requerido B',
-      intimacao_texto: `Decisão proferida. Intima-se OAB ${oabNumber}/${oabState} para ciência.`,
-      publicacao_data: targetDate,
-      tipo_publicacao: 'decisao',
-      raw_text: `[DJE TJSP ${targetDate}] Processo: 9876543-21.2024.8.26.0001 - Decisão - OAB ${oabNumber}/${oabState}`,
-      page_number: 156,
-      section: 'Judicial - 2ª Instância'
-    }
-  ];
-  
-  const executionTime = Date.now() - startTime;
-  
-  console.log(`[TJSP] ✅ Scraping concluído em ${executionTime}ms: ${testPublications.length} publicações encontradas`);
-  
-  return {
-    publications: testPublications,
-    metadata: {
-      pages_scraped: 2,
-      execution_time_ms: executionTime
-    }
-  };
-  
-  /* 
-  // 🚀 IMPLEMENTAÇÃO REAL (descomente quando estiver pronto)
-  
-  let browser: Browser | null = null;
-  
+  console.log(`[TJSP] Scraping for OAB ${oabNumber}/${oabState} on ${targetDate}`);
+
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
+    // TODO: Implementar scraping real com Playwright
+    // Por enquanto, retornar dados de teste
     
-    const page = await browser.newPage();
-    
-    // Navegar para DJE TJSP
-    await page.goto('https://dje.tjsp.jus.br/cdje/index.do', {
-      waitUntil: 'networkidle'
-    });
-    
-    // TODO: Implementar lógica de scraping
+    const testPublications: Publication[] = [
+      {
+        date: targetDate,
+        type: 'intimacao',
+        text: `INTIMAÇÃO - Processo nº 1234567-89.2024.8.26.0100 - Fica o advogado Dr. OAB ${oabNumber}/${oabState} intimado para manifestação no prazo de 15 dias.`,
+        processNumber: '1234567-89.2024.8.26.0100',
+        parties: ['Autor da Silva', 'Réu dos Santos'],
+        lawyers: [`OAB ${oabNumber}/${oabState}`],
+        urgency: 'normal',
+        source: 'DJE-TJSP',
+      },
+      {
+        date: targetDate,
+        type: 'despacho',
+        text: `DESPACHO - Processo nº 9876543-21.2024.8.26.0100 - Vista ao advogado OAB ${oabNumber}/${oabState} para ciência da decisão.`,
+        processNumber: '9876543-21.2024.8.26.0100',
+        parties: ['Empresa ABC Ltda', 'Banco XYZ S.A.'],
+        lawyers: [`OAB ${oabNumber}/${oabState}`],
+        urgency: 'low',
+        source: 'DJE-TJSP',
+      },
+    ];
+
+    console.log(`[TJSP] Found ${testPublications.length} test publications`);
+
+    return {
+      success: true,
+      publications: testPublications,
+    };
+
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[TJSP] Scraping error:', errorMessage);
     
     return {
+      success: false,
       publications: [],
-      metadata: {
-        pages_scraped: 0,
-        execution_time_ms: Date.now() - startTime
-      }
+      error: errorMessage,
     };
-    
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
-  */
 }
