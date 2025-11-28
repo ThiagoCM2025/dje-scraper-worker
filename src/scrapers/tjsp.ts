@@ -3,6 +3,10 @@ import { ScrapingResult, Publication } from '../types.js';
 
 const BUILD_VERSION = '4.0.0-playwright';
 
+/**
+ * Scraper TJSP com Playwright
+ * Faz scraping real do site dje.tjsp.jus.br
+ */
 export async function scrapeTJSP(
   oabNumber: string,
   oabState: string,
@@ -14,13 +18,19 @@ export async function scrapeTJSP(
   let browser: Browser | null = null;
   
   try {
+    // Lançar browser headless
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
     });
 
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
       locale: 'pt-BR'
     });
@@ -28,6 +38,7 @@ export async function scrapeTJSP(
     const page = await context.newPage();
     page.setDefaultTimeout(30000);
 
+    // Estratégia multi-caderno
     const cadernos = [
       { id: '', nome: 'Todos' },
       { id: '1', nome: '1ª Instância - Capital' },
@@ -51,10 +62,15 @@ export async function scrapeTJSP(
       }
     }
 
+    // Remover duplicatas
     const uniquePublications = deduplicatePublications(allPublications);
+
     console.log(`[TJSP] 🎯 Total: ${uniquePublications.length} publicações únicas`);
 
-    return { success: true, publications: uniquePublications };
+    return {
+      success: true,
+      publications: uniquePublications,
+    };
 
   } catch (error) {
     console.error('[TJSP] ❌ Erro no scraping:', error);
@@ -71,6 +87,9 @@ export async function scrapeTJSP(
   }
 }
 
+/**
+ * Busca em um caderno específico
+ */
 async function searchCaderno(
   page: Page,
   oabNumber: string,
@@ -79,25 +98,32 @@ async function searchCaderno(
 ): Promise<Publication[]> {
   const baseUrl = 'https://dje.tjsp.jus.br';
   
+  // 1. Navegar para página inicial
   await page.goto(`${baseUrl}/cdje/index.do`, { waitUntil: 'networkidle' });
   await page.waitForTimeout(1000);
 
+  // 2. Converter data para formato BR
   const dateBR = formatDateBR(targetDate);
   
+  // 3. Preencher formulário
+  // Campo de palavra-chave (número OAB)
   const palavrasChaveSelector = 'input[name="dadosConsulta.palavrasChave"]';
   await page.waitForSelector(palavrasChaveSelector, { timeout: 10000 });
   await page.fill(palavrasChaveSelector, oabNumber);
 
+  // Data de
   const dataDeSelector = 'input[name="dadosConsulta.dtPublicacaoDe"]';
   if (await page.locator(dataDeSelector).isVisible()) {
     await page.fill(dataDeSelector, dateBR);
   }
 
+  // Data até
   const dataAteSelector = 'input[name="dadosConsulta.dtPublicacaoAte"]';
   if (await page.locator(dataAteSelector).isVisible()) {
     await page.fill(dataAteSelector, dateBR);
   }
 
+  // Caderno (se especificado)
   if (cadernoId) {
     const cadernoSelector = 'select[name="dadosConsulta.cdCaderno"]';
     if (await page.locator(cadernoSelector).isVisible()) {
@@ -105,22 +131,30 @@ async function searchCaderno(
     }
   }
 
+  // 4. Clicar em pesquisar
   const submitButton = page.locator('input[type="submit"], button[type="submit"]').first();
   await submitButton.click();
 
+  // 5. Aguardar resultado
   await page.waitForLoadState('networkidle');
   await page.waitForTimeout(2000);
 
+  // 6. Obter HTML e extrair publicações
   const html = await page.content();
   
+  // Verificar se retornou página de erro ou sem resultados
   if (hasNoResultsMessage(html)) {
     console.log(`[TJSP] ℹ️ Sem resultados para caderno ${cadernoId || 'todos'}`);
     return [];
   }
 
+  // Extrair publicações
   return parsePublications(html, oabNumber, targetDate);
 }
 
+/**
+ * Verifica se a página indica "sem resultados"
+ */
 function hasNoResultsMessage(html: string): boolean {
   const noResultPatterns = [
     /nenhuma publica[çc][ãa]o encontrada/i,
@@ -134,19 +168,27 @@ function hasNoResultsMessage(html: string): boolean {
   return noResultPatterns.some(pattern => pattern.test(html));
 }
 
+/**
+ * Extrai publicações do HTML
+ */
 function parsePublications(html: string, oabNumber: string, targetDate: string): Publication[] {
   const publications: Publication[] = [];
   
+  // Verificar se contém conteúdo relevante
   const hasCNJ = /\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4}/.test(html);
   const hasOAB = html.toLowerCase().includes(oabNumber.toLowerCase());
   
-  if (!hasCNJ && !hasOAB) return [];
+  if (!hasCNJ && !hasOAB) {
+    return [];
+  }
 
+  // ESTRATÉGIA 1: Tabela principal
   const tableMatch = html.match(/<table[^>]+id=["']tabelaTodasPublicacoes["'][^>]*>([\s\S]*?)<\/table>/i);
-  if (tableMatch) {
+  if (tableMatch && tableMatch[0]) {
     return extractFromTable(tableMatch[0], oabNumber, targetDate);
   }
 
+  // ESTRATÉGIA 2: Qualquer tabela com conteúdo
   const tables = html.match(/<table[^>]*>([\s\S]*?)<\/table>/gi);
   if (tables) {
     for (const table of tables) {
@@ -158,6 +200,7 @@ function parsePublications(html: string, oabNumber: string, targetDate: string):
     }
   }
 
+  // ESTRATÉGIA 3: Regex por processos CNJ
   const processPattern = /\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4}/g;
   const matches = html.match(processPattern);
   
@@ -186,17 +229,22 @@ function parsePublications(html: string, oabNumber: string, targetDate: string):
   return publications;
 }
 
+/**
+ * Extrai publicações de uma tabela HTML
+ */
 function extractFromTable(tableHtml: string, oabNumber: string, targetDate: string): Publication[] {
   const publications: Publication[] = [];
   const rows = tableHtml.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
   
   let startIndex = 0;
-  if (rows.length > 0 && rows[0].toLowerCase().includes('<th')) {
+  if (rows.length > 0 && rows[0] && rows[0].toLowerCase().includes('<th')) {
     startIndex = 1;
   }
 
   for (let i = startIndex; i < rows.length; i++) {
     const row = rows[i];
+    if (!row) continue;
+    
     const cells = row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
     
     if (cells.length < 2) continue;
@@ -223,8 +271,12 @@ function extractFromTable(tableHtml: string, oabNumber: string, targetDate: stri
   return publications;
 }
 
+// ================== HELPERS ==================
+
 function formatDateBR(isoDate: string): string {
-  const [year, month, day] = isoDate.split('-');
+  const parts = isoDate.split('-');
+  if (parts.length !== 3) return isoDate;
+  const [year, month, day] = parts;
   return `${day}/${month}/${year}`;
 }
 
@@ -241,7 +293,7 @@ function cleanText(html: string): string {
 
 function extractProcessNumber(text: string): string | null {
   const match = text.match(/(\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4})/);
-  return match ? match[1] : null;
+  return match && match[1] ? match[1] : null;
 }
 
 function detectPublicationType(text: string): string {
@@ -261,12 +313,16 @@ function extractParties(text: string): string[] {
   const autorRegex = /(?:autor|requerente|exequente)[:\s]+([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ\s]+?)(?:\s+-|,|\.|\n)/gi;
   const reuRegex = /(?:réu|requerido|executado)[:\s]+([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ\s]+?)(?:\s+-|,|\.|\n)/gi;
   
-  let match;
+  let match: RegExpExecArray | null;
   while ((match = autorRegex.exec(text)) !== null) {
-    parties.push(match[1].trim());
+    if (match[1]) {
+      parties.push(match[1].trim());
+    }
   }
   while ((match = reuRegex.exec(text)) !== null) {
-    parties.push(match[1].trim());
+    if (match[1]) {
+      parties.push(match[1].trim());
+    }
   }
   
   return [...new Set(parties)];
@@ -277,10 +333,11 @@ function classifyUrgency(text: string): 'low' | 'normal' | 'high' | 'critical' {
   
   if (/urgente|urgência|imediato|citação/.test(lower)) return 'critical';
   if (/intimação pessoal|sentença|prazo fatal/.test(lower)) return 'high';
-  if (/prazo de \d+ dias?/.test(lower)) {
-    const match = lower.match(/prazo de (\d+) dias?/);
-    if (match) {
-      const days = parseInt(match[1]);
+  
+  const prazoMatch = lower.match(/prazo de (\d+) dias?/);
+  if (prazoMatch && prazoMatch[1]) {
+    const days = parseInt(prazoMatch[1], 10);
+    if (!isNaN(days)) {
       if (days <= 3) return 'critical';
       if (days <= 7) return 'high';
     }
