@@ -1,30 +1,40 @@
-import { WebhookPayload } from '../types.js';
+// src/webhook/sender.ts
+import { Publication, WebhookResponse } from '../types';
 
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL!;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET!;
 
-export async function sendWebhook(payload: WebhookPayload): Promise<void> {
-  if (!WEBHOOK_URL) {
-    console.log('⚠️ WEBHOOK_URL não configurada, pulando envio');
-    return;
+export async function sendResult(
+  jobId: string,
+  status: 'completed' | 'failed',
+  publications: Publication[] = [],
+  errorMessage?: string
+): Promise<void> {
+  const webhookUrl = `${SUPABASE_PROJECT_URL}/functions/v1/dje-webhook-receiver`;
+  console.log(`[WEBHOOK] Enviando resultado para: ${webhookUrl}`);
+  
+  const payload = {
+    jobId,
+    status,
+    publications,
+    error: errorMessage || null,
+    resultsCount: publications.length
+  };
+
+  const response = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'x-webhook-secret': WEBHOOK_SECRET,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Erro ao enviar resultado: ${response.status} - ${errorText}`);
   }
-
-  try {
-    const response = await fetch(WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(WEBHOOK_SECRET && { 'X-Webhook-Secret': WEBHOOK_SECRET }),
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      console.error(`❌ Webhook falhou: ${response.status} ${response.statusText}`);
-    } else {
-      console.log(`✅ Webhook enviado com sucesso para ${WEBHOOK_URL}`);
-    }
-  } catch (error) {
-    console.error('❌ Erro ao enviar webhook:', error);
-  }
+  
+  const result: WebhookResponse = await response.json();
+  console.log(`[WEBHOOK] ✅ Resultado enviado:`, result.message || 'OK');
 }
