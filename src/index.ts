@@ -1,48 +1,39 @@
-// src/index.ts
 import { CronJob } from 'cron';
 import { processQueue } from './queue/processor';
 
-const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+console.log('[WORKER] DJe Scraper Worker v3.0 starting...');
+console.log('[WORKER] Environment check:');
+console.log('  - SUPABASE_PROJECT_URL:', process.env.SUPABASE_PROJECT_URL ? '✓ Set' : '✗ Missing');
+console.log('  - WEBHOOK_SECRET:', process.env.WEBHOOK_SECRET ? '✓ Set' : '✗ Missing');
 
-console.log('🚀 DJE Railway Worker v2.0 (Edge Function Mode)');
-console.log('📡 Configuração:');
-console.log(`   - SUPABASE_PROJECT_URL: ${SUPABASE_PROJECT_URL ? '✓ Configurado' : '✗ FALTANDO!'}`);
-console.log(`   - WEBHOOK_SECRET: ${WEBHOOK_SECRET ? '✓ Configurado' : '✗ FALTANDO!'}`);
-
-if (!SUPABASE_PROJECT_URL || !WEBHOOK_SECRET) {
-  console.error('❌ Variáveis de ambiente obrigatórias não configuradas!');
-  process.exit(1);
-}
-
-// Processar a cada 5 minutos
+// Processar fila a cada 5 minutos
 const job = new CronJob('*/5 * * * *', async () => {
-  console.log('\n⏰ [CRON] Executando verificação da fila...');
+  console.log('[WORKER] Cron triggered - checking for pending jobs...');
   try {
     await processQueue();
   } catch (error) {
-    console.error('❌ [CRON] Erro ao processar fila:', error);
+    console.error('[WORKER] Error in cron job:', error);
   }
 });
 
 job.start();
-console.log('✅ Cron job iniciado (executa a cada 5 minutos)');
+console.log('[WORKER] Cron job started - running every 5 minutes');
 
-// Executar imediatamente ao iniciar
-console.log('🔄 Executando processamento inicial...');
-processQueue().catch(err => {
-  console.error('❌ Erro no processamento inicial:', err);
+// Também executar imediatamente na inicialização
+console.log('[WORKER] Running initial queue check...');
+processQueue().catch((error) => {
+  console.error('[WORKER] Error in initial queue check:', error);
 });
 
-// Manter processo vivo e tratar shutdown
+// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('🛑 SIGTERM recebido, encerrando worker...');
+  console.log('[WORKER] SIGTERM received, stopping...');
   job.stop();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('🛑 SIGINT recebido, encerrando worker...');
+  console.log('[WORKER] SIGINT received, stopping...');
   job.stop();
   process.exit(0);
 });
