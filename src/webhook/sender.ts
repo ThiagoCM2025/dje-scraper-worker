@@ -1,51 +1,34 @@
-// src/webhook/sender.ts
-import { Publication, WebhookResponse } from './types';
+// IMPORTANTE: Caminho relativo correto - subir um nível com ../
+import { WebhookPayload, WebhookResponse } from '../types';
 
-const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL || '';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
-export async function sendResult(
-  jobId: string, 
-  status: 'completed' | 'failed', 
-  publications: Publication[] = [], 
-  error: string | null = null
-): Promise<void> {
-  if (!SUPABASE_PROJECT_URL || !WEBHOOK_SECRET) {
-    console.error('[WEBHOOK] ❌ Variáveis de ambiente não configuradas!');
-    return;
-  }
+export async function sendWebhook(payload: WebhookPayload): Promise<void> {
+  console.log(`[WEBHOOK] Sending result for job ${payload.jobId} - status: ${payload.status}`);
 
-  const webhookUrl = `${SUPABASE_PROJECT_URL}/functions/v1/dje-webhook-receiver`;
-  console.log(`[WEBHOOK] Enviando resultado para: ${webhookUrl}`);
-  
   try {
-    const response = await fetch(webhookUrl, {
+    const response = await fetch(`${SUPABASE_PROJECT_URL}/functions/v1/dje-webhook-receiver`, {
       method: 'POST',
       headers: {
+        'Content-Type': 'application/json',
         'x-webhook-secret': WEBHOOK_SECRET,
-        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        jobId,
-        status,
-        publications,
-        error,
-        resultsCount: publications.length
-      })
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Erro ao enviar resultado: ${response.status} - ${errorText}`);
+      console.error('[WEBHOOK] Error response:', response.status, errorText);
+      throw new Error(`Webhook failed: ${response.status} - ${errorText}`);
     }
-    
-    // ✅ CORREÇÃO: Type assertion explícito
+
     const result = await response.json() as WebhookResponse;
-    console.log(`[WEBHOOK] ✅ Resultado enviado com sucesso:`, result.message || 'OK');
-    
+    console.log('[WEBHOOK] Result sent successfully:', result);
+
   } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Erro desconhecido';
-    console.error('[WEBHOOK] ❌ Erro ao enviar:', errorMessage);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[WEBHOOK] Error sending webhook:', errorMessage);
     throw error;
   }
 }
