@@ -1,50 +1,58 @@
-// src/types.ts
+// Tipos compartilhados para o Railway Worker
 
 export interface ScrapingJob {
   id: string;
+  user_id: string;
   monitoring_id: string;
-  tribunal: string;
-  target_date: string;
   oab_number: string;
   oab_state: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  target_date: string;
+  tribunal: string;
+  status: string;
   priority: number;
-  retry_count: number;
-  max_retries: number;
-  error_message?: string;
-  started_at?: string;
-  completed_at?: string;
   created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+  retry_count: number;
+  publications_found: number;
 }
 
+// Publication format expected by dje-webhook-receiver
 export interface Publication {
-  tribunal: string;
-  publication_date: string;
-  raw_text: string;
-  page_number?: number;
-  section?: string;
-  process_number?: string;
-  oab_numbers?: string[];
-  monitoring_id?: string;
+  date: string;
+  type: string;
+  text: string;
+  processNumber?: string;
+  parties?: string[];
+  lawyers?: string[];
+  urgency: 'low' | 'normal' | 'high' | 'critical';
+  source: string;
 }
 
 export interface ScrapingResult {
+  success: boolean;
   publications: Publication[];
-  tribunal: string;
-  searchDate: string;
+  error?: string;
 }
 
-// ✅ NOVO: Tipo para resposta da Edge Function get-pending-jobs
+export interface WebhookPayload {
+  jobId: string;
+  status: 'completed' | 'failed';
+  publications?: Publication[];
+  error?: string;
+  resultsCount?: number;
+}
+
 export interface GetJobsResponse {
   jobs: ScrapingJob[];
   count: number;
   message?: string;
+  error?: string;
 }
 
-// ✅ NOVO: Tipo para resposta da Edge Function webhook-receiver
 export interface WebhookResponse {
   success: boolean;
-  message?: string;
-  jobId?: string;
   publicationsInserted?: number;
+  error?: string;
 }
