@@ -1,4 +1,7 @@
-// Tipos compartilhados para o Railway Worker
+/**
+ * SINGLE SOURCE OF TRUTH - Railway Worker Types
+ * Compatível com Edge Functions e Schema do Banco
+ */
 
 export interface ScrapingJob {
   id: string;
@@ -6,19 +9,17 @@ export interface ScrapingJob {
   monitoring_id: string;
   oab_number: string;
   oab_state: string;
-  target_date: string;
   tribunal: string;
-  status: string;
+  target_date: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
   priority: number;
   created_at: string;
-  started_at: string | null;
-  completed_at: string | null;
-  error_message: string | null;
-  retry_count: number;
-  publications_found: number;
+  started_at?: string;
+  completed_at?: string;
+  error_message?: string;
+  publications_found?: number;
 }
 
-// Publication format expected by dje-webhook-receiver
 export interface Publication {
   date: string;
   type: string;
@@ -48,11 +49,9 @@ export interface GetJobsResponse {
   jobs: ScrapingJob[];
   count: number;
   message?: string;
-  error?: string;
 }
 
 export interface WebhookResponse {
   success: boolean;
-  publicationsInserted?: number;
-  error?: string;
+  publicationsInserted: number;
 }
