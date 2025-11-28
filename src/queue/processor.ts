@@ -1,77 +1,88 @@
-// src/queue/processor.ts
-import { ScrapingJob, Publication, GetJobsResponse } from './types';
-import { sendResult } from './webhook/sender';
-import { scrapeTJSP } from './scrapers/tjsp';
+// IMPORTANTE: Caminhos relativos corretos - subir um nível com ../
+import { ScrapingJob, GetJobsResponse, ScrapingResult } from '../types';
+import { sendWebhook } from '../webhook/sender';
+import { scrapeTJSP } from '../scrapers/tjsp';
 
-const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL || '';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 export async function processQueue(): Promise<void> {
-  console.log('[QUEUE] Buscando jobs pendentes via Edge Function...');
-
-  if (!SUPABASE_PROJECT_URL || !WEBHOOK_SECRET) {
-    console.error('[QUEUE] ❌ Variáveis de ambiente não configuradas!');
-    console.error('  - SUPABASE_PROJECT_URL:', SUPABASE_PROJECT_URL ? '✓' : '✗');
-    console.error('  - WEBHOOK_SECRET:', WEBHOOK_SECRET ? '✓' : '✗');
-    return;
-  }
-
+  console.log('[PROCESSOR] Fetching pending jobs from Edge Function...');
+  
   try {
-    // 1. Buscar jobs pendentes via Edge Function
-    const getJobsUrl = `${SUPABASE_PROJECT_URL}/functions/v1/dje-get-pending-jobs`;
-    console.log(`[QUEUE] Chamando: ${getJobsUrl}`);
-    
-    const response = await fetch(getJobsUrl, {
+    // Buscar jobs pendentes via Edge Function
+    const response = await fetch(`${SUPABASE_PROJECT_URL}/functions/v1/dje-get-pending-jobs`, {
       method: 'GET',
       headers: {
+        'Content-Type': 'application/json',
         'x-webhook-secret': WEBHOOK_SECRET,
-        'Content-Type': 'application/json'
-      }
+      },
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Erro ao buscar jobs: ${response.status} - ${errorText}`);
-    }
-
-    // ✅ CORREÇÃO: Type assertion explícito
-    const data = await response.json() as GetJobsResponse;
-    const { jobs, count } = data;
-    
-    console.log(`[QUEUE] ✅ ${count || 0} jobs encontrados`);
-
-    if (!jobs || jobs.length === 0) {
-      console.log('[QUEUE] Nenhum job pendente. Aguardando próximo ciclo...');
+      console.error('[PROCESSOR] Edge Function error:', response.status, errorText);
       return;
     }
 
-    // 2. Processar cada job
-    for (const job of jobs) {
-      console.log(`[QUEUE] 🔄 Processando job ${job.id}`);
-      console.log(`  - OAB: ${job.oab_number}/${job.oab_state}`);
-      console.log(`  - Tribunal: ${job.tribunal}`);
-      console.log(`  - Data: ${job.target_date}`);
-      
-      try {
-        // Fazer scraping
-        const result = await scrapeTJSP(job.oab_number, job.oab_state, job.target_date);
-        const publications = result.publications || [];
-        
-        // Enviar resultado para webhook
-        await sendResult(job.id, 'completed', publications);
-        console.log(`[QUEUE] ✅ Job ${job.id} completado: ${publications.length} publicações`);
-        
-      } catch (error: unknown) {
-        const errorMessage = error instanceof Error ? error.message : 'Erro desconhecido';
-        console.error(`[QUEUE] ❌ Erro no job ${job.id}:`, errorMessage);
-        await sendResult(job.id, 'failed', [], errorMessage);
-      }
+    const data = await response.json() as GetJobsResponse;
+    const { jobs, count } = data;
+
+    if (!jobs || jobs.length === 0) {
+      console.log('[PROCESSOR] No pending jobs found');
+      return;
     }
 
-    console.log('[QUEUE] ✅ Ciclo de processamento concluído');
+    console.log(`[PROCESSOR] Found ${count} jobs to process`);
+
+    // Processar cada job
+    for (const job of jobs) {
+      await processJob(job);
+    }
 
   } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Erro desconhecido';
-    console.error('[QUEUE] ❌ Erro fatal:', errorMessage);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[PROCESSOR] Error fetching jobs:', errorMessage);
+  }
+}
+
+async function processJob(job: ScrapingJob): Promise<void> {
+  console.log(`[PROCESSOR] Processing job ${job.id} for OAB ${job.oab_number}/${job.oab_state}`);
+
+  try {
+    // Executar scraping baseado no tribunal
+    let result: ScrapingResult;
+    
+    switch (job.tribunal.toUpperCase()) {
+      case 'TJSP':
+        result = await scrapeTJSP(job.oab_number, job.oab_state, job.target_date);
+        break;
+      default:
+        console.log(`[PROCESSOR] Unknown tribunal: ${job.tribunal}, using TJSP scraper`);
+        result = await scrapeTJSP(job.oab_number, job.oab_state, job.target_date);
+    }
+
+    // Enviar resultado via webhook
+    await sendWebhook({
+      jobId: job.id,
+      status: result.success ? 'completed' : 'failed',
+      publications: result.publications,
+      error: result.error,
+      resultsCount: result.publications.length,
+    });
+
+    console.log(`[PROCESSOR] Job ${job.id} completed with ${result.publications.length} publications`);
+
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`[PROCESSOR] Error processing job ${job.id}:`, errorMessage);
+
+    // Enviar erro via webhook
+    await sendWebhook({
+      jobId: job.id,
+      status: 'failed',
+      error: errorMessage,
+      resultsCount: 0,
+    });
   }
 }
