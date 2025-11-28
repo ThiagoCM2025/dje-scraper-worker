@@ -1,10 +1,16 @@
-import { ScraperFunction } from '../types';
-import { scrapeTJSP } from './tjsp';
+import { ScrapingResult } from '../types.js';
 
-// Mapa de tribunais para suas funções de scraping
-export const scrapers: Record<string, ScraperFunction> = {
-  'TJSP': scrapeTJSP,
-  'tjsp': scrapeTJSP,
-};
+export interface Scraper {
+  (oabNumber: string, oabState: string, targetDate: string): Promise<ScrapingResult>;
+}
 
-export { scrapeTJSP };
+export function getScraperForTribunal(tribunal: string): Scraper {
+  const scrapers: Record<string, Scraper> = {
+    TJSP: async (oab, state, date) => {
+      const { scrapeTJSP } = await import('./tjsp.js');
+      return scrapeTJSP(oab, state, date);
+    },
+  };
+
+  return scrapers[tribunal] || scrapers.TJSP;
+}
