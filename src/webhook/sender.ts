@@ -1,14 +1,13 @@
-// IMPORTANTE: Caminho relativo correto - subir um nível com ../
-import { WebhookPayload, WebhookResponse } from '../types';
+import { WebhookPayload, WebhookResponse } from '../types.js';
 
-const SUPABASE_PROJECT_URL = process.env.SUPABASE_PROJECT_URL || '';
+const SUPABASE_URL = process.env.SUPABASE_PROJECT_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 export async function sendWebhook(payload: WebhookPayload): Promise<void> {
-  console.log(`[WEBHOOK] Sending result for job ${payload.jobId} - status: ${payload.status}`);
+  console.log(`[WEBHOOK] 📤 Enviando resultado do job ${payload.jobId}...`);
 
   try {
-    const response = await fetch(`${SUPABASE_PROJECT_URL}/functions/v1/dje-webhook-receiver`, {
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/dje-webhook-receiver`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -19,16 +18,13 @@ export async function sendWebhook(payload: WebhookPayload): Promise<void> {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('[WEBHOOK] Error response:', response.status, errorText);
       throw new Error(`Webhook failed: ${response.status} - ${errorText}`);
     }
 
     const result = await response.json() as WebhookResponse;
-    console.log('[WEBHOOK] Result sent successfully:', result);
-
-  } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[WEBHOOK] Error sending webhook:', errorMessage);
+    console.log(`[WEBHOOK] ✅ Webhook enviado: ${result.publicationsInserted} publicações inseridas`);
+  } catch (error) {
+    console.error('[WEBHOOK] ❌ Erro ao enviar webhook:', error);
     throw error;
   }
 }
