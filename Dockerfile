@@ -1,10 +1,8 @@
-FROM mcr.microsoft.com/playwright:v1.55.1-jammy
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
 WORKDIR /app
-
 COPY package.json package-lock.json* ./
 RUN npm install
-
 COPY . .
 RUN npm run build
 
