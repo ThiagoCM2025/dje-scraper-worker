@@ -1,21 +1,21 @@
 {
   "name": "dje-scraper-worker",
   "version": "3.1.0",
-  "description": "DJE scraping worker for Railway deployment",
+  "description": "DJE Scraper Worker com Playwright",
   "main": "dist/index.js",
-  "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4",
-    "playwright": "1.57.0",
-    "cron": "^3.1.7"
+    "@supabase/supabase-js": "^2.47.0",
+    "cron": "^3.1.7",
+    "playwright": "1.57.0"
   },
   "devDependencies": {
+    "@types/cron": "^2.4.0",
     "@types/node": "^20.10.0",
-    "@types/cron": "^2.0.1",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.0"
   }
 }
