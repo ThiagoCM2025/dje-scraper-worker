@@ -1,0 +1,16 @@
+{
+  "name": "dje-scraper-worker",
+  "version": "1.0.0",
+  "description": "Worker para scraping DJe TJSP com Playwright",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "playwright": "1.55.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
