@@ -1,5 +1,5 @@
 // ========================================================
-// DJe Scraper Worker v8.0 - CORREÇÃO DEFINITIVA DE DATAS
+// DJe Scraper Worker v8.0 - CORREÇÃO DEFINITIVA DE DATASS
 // ========================================================
 // Changelog v8.0:
 // - Verificação de datas APÓS preenchimento
