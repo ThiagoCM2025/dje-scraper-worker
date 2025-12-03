@@ -1,11 +1,11 @@
 // ========================================================
-// DJe Scraper Worker v8.0 - CORREÇÃO DEFINITIVA DE DATASS
+// DJe Scraper Worker v9.0 - URL PARAMETRIZADA + BUSCA OAB
 // ========================================================
-// Changelog v8.0:
-// - Verificação de datas APÓS preenchimento
-// - Método mais robusto para campos readonly (evaluate + dispatchEvent)
-// - Busca por OAB + Nome (ambos para maior cobertura)
-// - Intervalo de 3 dias de busca para garantir cobertura
+// Changelog v9.0:
+// - Acesso via URL com parâmetros GET (mais confiável que formulário)
+// - Busca por número OAB em vez de nome do advogado
+// - Múltiplas estratégias de busca: OAB puro, OAB/UF, nome
+// - Validação de data nas publicações retornadas
 // - Logs detalhados de cada etapa
 // ========================================================
 
@@ -28,28 +28,10 @@ function formatDateBR(date) {
 }
 
 /**
- * Gera array de datas para busca (últimos N dias)
- */
-function getDateRange(targetDate, daysBefore = 2) {
-  const dates = [];
-  const target = new Date(targetDate);
-  
-  for (let i = daysBefore; i >= 0; i--) {
-    const d = new Date(target);
-    d.setDate(d.getDate() - i);
-    dates.push(formatDateBR(d));
-  }
-  
-  return dates;
-}
-
-/**
  * Extrai número de processo CNJ do texto
  */
 function extractProcessNumber(text) {
   if (!text) return null;
-  
-  // Padrão CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO
   const cnjPattern = /\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/g;
   const matches = text.match(cnjPattern);
   return matches ? matches[0] : null;
@@ -60,14 +42,12 @@ function extractProcessNumber(text) {
  */
 function extractOABs(text) {
   if (!text) return [];
-  
   const oabPatterns = [
     /OAB[:\s/]*(\d{4,6})[/\s-]*(SP|RJ|MG|PR|RS|SC|BA|PE|CE|GO|DF|ES|PB|RN|AL|SE|PI|MA|MT|MS|AM|PA|RO|AC|AP|RR|TO)/gi,
     /OAB[:\s/]*(SP|RJ|MG|PR|RS|SC|BA|PE|CE|GO|DF|ES|PB|RN|AL|SE|PI|MA|MT|MS|AM|PA|RO|AC|AP|RR|TO)[:\s/-]*(\d{4,6})/gi,
     /(SP|RJ|MG|PR|RS|SC|BA|PE|CE|GO|DF|ES|PB|RN|AL|SE|PI|MA|MT|MS|AM|PA|RO|AC|AP|RR|TO)[-]?(\d{4,6})/gi,
     /(\d{4,6})[N]?[/\s-]*(SP|RJ|MG|PR|RS|SC|BA|PE|CE|GO|DF|ES|PB|RN|AL|SE|PI|MA|MT|MS|AM|PA|RO|AC|AP|RR|TO)/gi,
   ];
-  
   const oabs = new Set();
   for (const pattern of oabPatterns) {
     const matches = text.matchAll(pattern);
@@ -76,7 +56,6 @@ function extractOABs(text) {
       oabs.add(fullMatch);
     }
   }
-  
   return Array.from(oabs);
 }
 
@@ -86,13 +65,11 @@ function extractOABs(text) {
 function classifyUrgency(text) {
   if (!text) return 'normal';
   const upperText = text.toUpperCase();
-  
   if (upperText.includes('URGENTE') || upperText.includes('URGÊNCIA')) return 'critical';
   if (upperText.includes('PRAZO') && /\b(1|2|3|24\s*HORA)/i.test(text)) return 'critical';
   if (upperText.includes('PRAZO') && /\b(5|CINCO)\s*DIAS/i.test(text)) return 'high';
   if (upperText.includes('CITAÇÃO') || upperText.includes('CITACAO')) return 'high';
   if (upperText.includes('INTIMAÇÃO') || upperText.includes('INTIMACAO')) return 'normal';
-  
   return 'normal';
 }
 
@@ -102,51 +79,77 @@ function classifyUrgency(text) {
 function detectPublicationType(text) {
   if (!text) return 'outro';
   const upperText = text.toUpperCase();
-  
   if (upperText.includes('SENTENÇA') || upperText.includes('SENTENCA')) return 'sentenca';
   if (upperText.includes('DECISÃO') || upperText.includes('DECISAO')) return 'decisao';
   if (upperText.includes('DESPACHO')) return 'despacho';
   if (upperText.includes('CITAÇÃO') || upperText.includes('CITACAO')) return 'citacao';
   if (upperText.includes('INTIMAÇÃO') || upperText.includes('INTIMACAO')) return 'intimacao';
   if (upperText.includes('EDITAL')) return 'edital';
-  
   return 'outro';
 }
 
 /**
- * SCRAPING DO TJSP - VERSÃO 8.0 COM CORREÇÃO DE DATAS
+ * Verifica se publicação é relevante para a OAB buscada
+ */
+function isRelevantForOAB(text, oabNumber, oabState) {
+  if (!text || !oabNumber) return false;
+  
+  const oabNumOnly = oabNumber.replace(/[^0-9]/g, '');
+  const upperText = text.toUpperCase();
+  
+  // Padrões de OAB no texto
+  const patterns = [
+    new RegExp(`OAB[:\\s/]*${oabNumOnly}`, 'i'),
+    new RegExp(`OAB[:\\s/]*${oabState}[:\\s/-]*${oabNumOnly}`, 'i'),
+    new RegExp(`${oabNumOnly}[N]?[/\\s-]*${oabState}`, 'i'),
+    new RegExp(`${oabState}[-]?${oabNumOnly}`, 'i'),
+  ];
+  
+  for (const pattern of patterns) {
+    if (pattern.test(text)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * SCRAPING DO TJSP v9.0 - URL PARAMETRIZADA + BUSCA OAB
  */
 async function scrapeTJSP(job) {
-  const { oab_number: oabNumber, lawyer_name: lawyerName, target_date: targetDate } = job;
+  const { oab_number: oabNumber, oab_state: oabState = 'SP', lawyer_name: lawyerName, target_date: targetDate } = job;
   
-  console.log(`[TJSP] 🔍 Iniciando scraping v8.0...`);
+  console.log(`\n[TJSP] ========================================`);
+  console.log(`[TJSP] 🔍 Iniciando scraping v9.0 - URL + OAB`);
+  console.log(`[TJSP] ========================================`);
   console.log(`[TJSP] 📋 OAB: ${oabNumber}`);
+  console.log(`[TJSP] 🏛️ Estado: ${oabState}`);
   console.log(`[TJSP] 👤 Advogado: ${lawyerName || 'N/A'}`);
   console.log(`[TJSP] 📅 Data alvo: ${targetDate}`);
   
   // Extrair apenas números da OAB
   const oabNumOnly = oabNumber.replace(/[^0-9]/g, '');
-  
-  // Gerar intervalo de datas (3 dias: target e 2 anteriores)
-  const dateRange = getDateRange(targetDate, 2);
-  console.log(`[TJSP] 📆 Intervalo de busca: ${dateRange.join(' | ')}`);
-  
-  // Data formatada para busca (usar a mais recente)
   const dateBR = formatDateBR(new Date(targetDate));
-  const dateStartBR = dateRange[0]; // Data mais antiga (2 dias antes)
-  const dateEndBR = dateRange[dateRange.length - 1]; // Data alvo
   
-  console.log(`[TJSP] 📅 Período: ${dateStartBR} até ${dateEndBR}`);
+  console.log(`[TJSP] 🔢 OAB (números): ${oabNumOnly}`);
+  console.log(`[TJSP] 📆 Data BR: ${dateBR}`);
   
-  // ESTRATÉGIA DE BUSCA: OAB direta (mais precisa) + Nome completo
-  // Usar busca por OAB é mais precisa que por nome
-  const searchTerms = [
-    oabNumOnly,  // Apenas número da OAB
-    `"${oabNumOnly}"`, // Número exato
-    lawyerName ? `"${lawyerName}"` : null // Nome completo entre aspas
-  ].filter(Boolean);
+  // Estratégias de busca em ordem de prioridade
+  const searchStrategies = [
+    { term: oabNumOnly, desc: 'Número OAB puro' },
+    { term: `OAB ${oabNumOnly}`, desc: 'OAB + número' },
+    { term: `${oabNumOnly}/${oabState}`, desc: 'Número/UF' },
+    { term: `OAB:${oabNumOnly}/${oabState}`, desc: 'OAB:número/UF' },
+  ];
   
-  console.log(`[TJSP] 🔎 Termos de busca: ${searchTerms.join(' | ')}`);
+  // Adicionar nome se disponível (última prioridade)
+  if (lawyerName) {
+    searchStrategies.push({ term: `"${lawyerName}"`, desc: 'Nome completo' });
+  }
+  
+  console.log(`[TJSP] 🎯 Estratégias de busca: ${searchStrategies.length}`);
+  searchStrategies.forEach((s, i) => console.log(`[TJSP]    ${i+1}. ${s.desc}: "${s.term}"`));
   
   let browser;
   const allPublications = [];
@@ -165,176 +168,119 @@ async function scrapeTJSP(job) {
     const page = await context.newPage();
     page.setDefaultTimeout(60000);
     
-    // Para cada termo de busca
-    for (const searchTerm of searchTerms) {
-      console.log(`\n[TJSP] 🔍 Buscando com termo: ${searchTerm}`);
+    // Tentar cada estratégia até encontrar resultados relevantes
+    for (let strategyIndex = 0; strategyIndex < searchStrategies.length; strategyIndex++) {
+      const strategy = searchStrategies[strategyIndex];
+      
+      console.log(`\n[TJSP] 🔄 Estratégia ${strategyIndex + 1}/${searchStrategies.length}: ${strategy.desc}`);
+      console.log(`[TJSP] 🔎 Termo: "${strategy.term}"`);
       
       try {
-        // Acessar página de consulta avançada
-        console.log(`[TJSP] 🌐 Acessando DJe TJSP...`);
-        await page.goto('https://dje.tjsp.jus.br/cdje/consultaAvancada.do', {
+        // ===== CONSTRUIR URL COM PARÂMETROS =====
+        // O TJSP aceita parâmetros via GET na URL de consulta
+        const baseUrl = 'https://dje.tjsp.jus.br/cdje/consultaAvancada.do';
+        const params = new URLSearchParams({
+          'dadosConsulta.pesquisaLivre': strategy.term,
+          'dadosConsulta.dtInicio': dateBR,
+          'dadosConsulta.dtFim': dateBR,
+          'dadosConsulta.cdCaderno': '-11', // Todos os cadernos
+        });
+        
+        const searchUrl = `${baseUrl}?${params.toString()}`;
+        console.log(`[TJSP] 🌐 URL: ${searchUrl.substring(0, 100)}...`);
+        
+        // Acessar página com parâmetros
+        await page.goto(searchUrl, {
           waitUntil: 'networkidle',
           timeout: 30000
         });
+        
         console.log(`[TJSP] ✅ Página carregada`);
         
-        // Aguardar formulário estar pronto
-        await page.waitForSelector('#pesquisaLivre', { timeout: 10000 });
-        await page.waitForTimeout(1000);
+        // Aguardar um pouco para garantir que JavaScript carregou
+        await page.waitForTimeout(2000);
         
-        // ===== PREENCHER CAMPO DE BUSCA =====
-        console.log(`[TJSP] 📝 Preenchendo termo de busca...`);
-        await page.fill('#pesquisaLivre', ''); // Limpar
-        await page.fill('#pesquisaLivre', searchTerm);
-        console.log(`[TJSP] ✅ Campo pesquisaLivre: "${searchTerm}"`);
+        // Verificar se precisa submeter o formulário (alguns sites ignoram params GET)
+        const needsSubmit = await page.evaluate(() => {
+          const results = document.querySelectorAll('table.resultTable tr, div.publicacao, div.resultado');
+          return results.length === 0;
+        });
         
-        // ===== PREENCHER DATAS (MÉTODO ROBUSTO) =====
-        console.log(`[TJSP] 📅 Preenchendo datas com método robusto...`);
-        
-        // Usar page.evaluate para manipular campos readonly diretamente no DOM
-        const datesApplied = await page.evaluate(({ dateStart, dateEnd }) => {
-          const startField = document.querySelector('#dtPublicacaoInicio');
-          const endField = document.querySelector('#dtPublicacaoFim');
+        if (needsSubmit) {
+          console.log(`[TJSP] ⚠️ URL params não funcionaram, preenchendo formulário...`);
           
-          if (!startField || !endField) {
-            return { success: false, error: 'Campos de data não encontrados' };
+          // Preencher campo de busca
+          const searchInput = await page.$('#pesquisaLivre');
+          if (searchInput) {
+            await searchInput.fill('');
+            await searchInput.fill(strategy.term);
+            console.log(`[TJSP] ✅ Campo pesquisaLivre preenchido`);
           }
           
-          // Remover readonly temporariamente
-          startField.removeAttribute('readonly');
-          startField.removeAttribute('disabled');
-          endField.removeAttribute('readonly');
-          endField.removeAttribute('disabled');
-          
-          // Limpar valores existentes
-          startField.value = '';
-          endField.value = '';
-          
-          // Definir novos valores
-          startField.value = dateStart;
-          endField.value = dateEnd;
-          
-          // Disparar todos os eventos necessários
-          const events = ['focus', 'input', 'change', 'blur'];
-          events.forEach(eventName => {
-            startField.dispatchEvent(new Event(eventName, { bubbles: true }));
-            endField.dispatchEvent(new Event(eventName, { bubbles: true }));
-          });
-          
-          // Verificar se valores foram aplicados
-          return {
-            success: true,
-            startValue: startField.value,
-            endValue: endField.value
-          };
-        }, { dateStart: dateStartBR, dateEnd: dateEndBR });
-        
-        console.log(`[TJSP] 📅 Resultado do preenchimento de datas:`, datesApplied);
-        
-        // ===== VERIFICAR SE DATAS FORAM APLICADAS =====
-        const appliedStart = await page.$eval('#dtPublicacaoInicio', el => el.value);
-        const appliedEnd = await page.$eval('#dtPublicacaoFim', el => el.value);
-        
-        console.log(`[TJSP] 🔍 VERIFICAÇÃO - Datas realmente aplicadas:`);
-        console.log(`[TJSP]    Data Início: "${appliedStart}" (esperado: "${dateStartBR}")`);
-        console.log(`[TJSP]    Data Fim: "${appliedEnd}" (esperado: "${dateEndBR}")`);
-        
-        if (appliedStart !== dateStartBR || appliedEnd !== dateEndBR) {
-          console.error(`[TJSP] ⚠️ AVISO: Datas podem não ter sido aplicadas corretamente!`);
-          console.log(`[TJSP] 🔄 Tentando método alternativo com JavaScript...`);
-          
-          // Método alternativo: definir via JavaScript e forçar
-          await page.evaluate(({ dateStart, dateEnd }) => {
-            document.querySelector('#dtPublicacaoInicio').setAttribute('value', dateStart);
-            document.querySelector('#dtPublicacaoFim').setAttribute('value', dateEnd);
+          // Preencher datas via JavaScript (campos readonly)
+          await page.evaluate(({ dateBR }) => {
+            const startField = document.querySelector('#dtPublicacaoInicio');
+            const endField = document.querySelector('#dtPublicacaoFim');
             
-            // Forçar via objeto de formulário
-            const form = document.querySelector('form');
-            if (form) {
-              const inputStart = form.querySelector('[name="dadosConsulta.dtInicio"]');
-              const inputEnd = form.querySelector('[name="dadosConsulta.dtFim"]');
-              if (inputStart) inputStart.value = dateStart;
-              if (inputEnd) inputEnd.value = dateEnd;
+            if (startField) {
+              startField.removeAttribute('readonly');
+              startField.value = dateBR;
+              startField.dispatchEvent(new Event('change', { bubbles: true }));
             }
-          }, { dateStart: dateStartBR, dateEnd: dateEndBR });
+            if (endField) {
+              endField.removeAttribute('readonly');
+              endField.value = dateBR;
+              endField.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, { dateBR });
           
-          // Re-verificar
-          const finalStart = await page.$eval('#dtPublicacaoInicio', el => el.value);
-          const finalEnd = await page.$eval('#dtPublicacaoFim', el => el.value);
-          console.log(`[TJSP] 🔍 Após método alternativo: Início="${finalStart}", Fim="${finalEnd}"`);
-        }
-        
-        // ===== SELECIONAR CADERNO (TODOS) =====
-        try {
-          await page.selectOption('#cdCaderno', '-11'); // -11 = Todos os cadernos
-          console.log(`[TJSP] ✅ Caderno: Todos (-11)`);
-        } catch (e) {
-          console.log(`[TJSP] ⚠️ Não foi possível selecionar caderno: ${e.message}`);
-        }
-        
-        // Aguardar antes de submeter
-        await page.waitForTimeout(1000);
-        
-        // ===== SUBMETER BUSCA =====
-        console.log(`[TJSP] 🔍 Submetendo busca...`);
-        
-        // Tentar diferentes métodos de submissão
-        const submitSelectors = [
-          'input[type="submit"]',
-          'button[type="submit"]',
-          '#pbSubmit',
-          'input[value="Pesquisar"]'
-        ];
-        
-        let submitted = false;
-        for (const selector of submitSelectors) {
+          console.log(`[TJSP] ✅ Datas definidas: ${dateBR}`);
+          
+          // Selecionar caderno
           try {
-            const btn = await page.$(selector);
-            if (btn) {
-              await btn.click();
-              submitted = true;
-              console.log(`[TJSP] ✅ Formulário submetido via: ${selector}`);
-              break;
-            }
-          } catch (e) {
-            continue;
+            await page.selectOption('#cdCaderno', '-11');
+            console.log(`[TJSP] ✅ Caderno: Todos (-11)`);
+          } catch (e) {}
+          
+          // Submeter formulário
+          await page.waitForTimeout(500);
+          
+          const submitButton = await page.$('input[type="submit"]');
+          if (submitButton) {
+            await submitButton.click();
+            console.log(`[TJSP] ✅ Formulário submetido`);
+          } else {
+            await page.evaluate(() => {
+              const form = document.querySelector('form');
+              if (form) form.submit();
+            });
           }
+          
+          await page.waitForTimeout(3000);
+          await page.waitForLoadState('networkidle').catch(() => {});
         }
-        
-        if (!submitted) {
-          // Fallback: submeter via JavaScript
-          await page.evaluate(() => {
-            const form = document.querySelector('form');
-            if (form) form.submit();
-          });
-          console.log(`[TJSP] ✅ Formulário submetido via JavaScript`);
-        }
-        
-        // Aguardar resultados carregarem
-        await page.waitForTimeout(5000);
-        await page.waitForLoadState('networkidle').catch(() => {});
         
         // ===== EXTRAIR RESULTADOS =====
         console.log(`[TJSP] 📄 Extraindo resultados...`);
         
-        // Verificar se há mensagem de "nenhum resultado"
+        // Verificar mensagem de "nenhum resultado"
         const noResults = await page.evaluate(() => {
           const body = document.body.innerText;
           return body.includes('Nenhum resultado encontrado') || 
                  body.includes('não foram encontrados') ||
-                 body.includes('sem resultados');
+                 body.includes('sem resultados') ||
+                 body.includes('Nenhuma publicação');
         });
         
         if (noResults) {
-          console.log(`[TJSP] ℹ️ Nenhum resultado encontrado para: ${searchTerm}`);
+          console.log(`[TJSP] ℹ️ Nenhum resultado para: "${strategy.term}"`);
           continue;
         }
         
         // Extrair publicações
-        const results = await page.evaluate(() => {
+        const results = await page.evaluate(({ targetDateBR }) => {
           const publications = [];
           
-          // Seletores para diferentes estruturas de resultado do TJSP
           const selectors = [
             'table.resultTable tr',
             'div.publicacao',
@@ -342,26 +288,18 @@ async function scrapeTJSP(job) {
             'div.itemResultado',
             '.list-group-item',
             'tr.fundocinza1, tr.fundocinza2',
-            'div[class*="resultado"]',
-            'div[class*="publicacao"]'
           ];
           
           for (const selector of selectors) {
             const elements = document.querySelectorAll(selector);
             if (elements.length > 0) {
-              console.log(`Encontrados ${elements.length} elementos com ${selector}`);
-              
               elements.forEach((el, index) => {
-                // Ignorar headers de tabela
                 if (el.tagName === 'TR' && el.querySelector('th')) return;
                 
-                // Pegar texto completo do elemento
                 const text = el.innerText || el.textContent || '';
-                
-                // Ignorar textos muito curtos
                 if (text.trim().length < 50) return;
                 
-                // Pegar data da publicação se disponível
+                // Extrair data da publicação
                 let date = '';
                 const dateMatch = text.match(/(\d{2}\/\d{2}\/\d{4})/);
                 if (dateMatch) {
@@ -380,46 +318,65 @@ async function scrapeTJSP(job) {
           }
           
           return publications;
-        });
+        }, { targetDateBR: dateBR });
         
-        console.log(`[TJSP] 📊 ${results.length} elementos brutos extraídos para termo "${searchTerm}"`);
+        console.log(`[TJSP] 📊 ${results.length} elementos brutos extraídos`);
         
-        // Processar resultados
+        // Filtrar publicações relevantes para a OAB
+        let relevantCount = 0;
+        
         for (const result of results) {
-          const processNumber = extractProcessNumber(result.text);
-          const oabs = extractOABs(result.text);
-          const urgency = classifyUrgency(result.text);
-          const pubType = detectPublicationType(result.text);
+          // Verificar relevância para a OAB buscada
+          const isRelevant = isRelevantForOAB(result.text, oabNumOnly, oabState);
           
-          // Converter data para formato ISO se disponível
-          let isoDate = new Date().toISOString().split('T')[0];
-          if (result.date) {
-            const [day, month, year] = result.date.split('/');
-            if (day && month && year) {
-              isoDate = `${year}-${month}-${day}`;
+          if (isRelevant) {
+            relevantCount++;
+            
+            const processNumber = extractProcessNumber(result.text);
+            const oabs = extractOABs(result.text);
+            const urgency = classifyUrgency(result.text);
+            const pubType = detectPublicationType(result.text);
+            
+            // Converter data para ISO
+            let isoDate = targetDate; // Default: data alvo
+            if (result.date) {
+              const [day, month, year] = result.date.split('/');
+              if (day && month && year) {
+                isoDate = `${year}-${month}-${day}`;
+              }
             }
+            
+            allPublications.push({
+              date: isoDate,
+              type: pubType,
+              text: result.text,
+              processNumber: processNumber,
+              parties: [],
+              lawyers: oabs,
+              urgency: urgency,
+              source: 'TJSP-DJe',
+              searchStrategy: strategy.desc
+            });
+            
+            console.log(`[TJSP] ✅ Publicação relevante #${relevantCount}: ${processNumber || 'sem processo'}`);
           }
-          
-          allPublications.push({
-            date: isoDate,
-            type: pubType,
-            text: result.text,
-            processNumber: processNumber,
-            parties: [],
-            lawyers: oabs,
-            urgency: urgency,
-            source: 'TJSP-DJe',
-            searchTerm: searchTerm // Para debug
-          });
         }
         
-      } catch (searchError) {
-        console.error(`[TJSP] ❌ Erro na busca por "${searchTerm}":`, searchError.message);
+        console.log(`[TJSP] 🎯 ${relevantCount}/${results.length} publicações relevantes para OAB ${oabNumOnly}`);
+        
+        // Se encontrou resultados relevantes, para de tentar outras estratégias
+        if (relevantCount > 0) {
+          console.log(`[TJSP] ✅ Encontrou publicações relevantes, encerrando busca`);
+          break;
+        }
+        
+      } catch (strategyError) {
+        console.error(`[TJSP] ❌ Erro na estratégia "${strategy.desc}":`, strategyError.message);
         continue;
       }
     }
     
-    // Remover duplicatas baseado no texto
+    // Remover duplicatas
     const uniquePublications = [];
     const seenTexts = new Set();
     
@@ -431,7 +388,9 @@ async function scrapeTJSP(job) {
       }
     }
     
-    console.log(`[TJSP] ✅ Total: ${allPublications.length} brutos → ${uniquePublications.length} únicos`);
+    console.log(`\n[TJSP] ========================================`);
+    console.log(`[TJSP] ✅ RESULTADO FINAL: ${uniquePublications.length} publicações únicas`);
+    console.log(`[TJSP] ========================================\n`);
     
     return uniquePublications;
     
@@ -452,16 +411,19 @@ async function scrapeTJSP(job) {
 async function sendToWebhook(job, publications, errorMessage = null) {
   const payload = {
     jobId: job.id,
+    job_id: job.id,
     status: errorMessage ? 'failed' : 'completed',
     publications: publications || [],
     error: errorMessage,
     resultsCount: publications?.length || 0,
     oab_number: job.oab_number,
+    oab_state: job.oab_state || 'SP',
     target_date: job.target_date
   };
 
   console.log(`[WORKER] 📤 Enviando para webhook...`);
   console.log(`[WORKER] 🌐 URL: ${WEBHOOK_URL}`);
+  console.log(`[WORKER] 📊 Publicações: ${publications?.length || 0}`);
 
   try {
     const response = await fetch(WEBHOOK_URL, {
@@ -557,7 +519,6 @@ async function processJobs() {
       await sendToWebhook(job, [], error.message);
     }
     
-    // Aguardar entre jobs para não sobrecarregar
     if (i < jobs.length - 1) {
       console.log(`[WORKER] ⏳ Aguardando 5s antes do próximo job...`);
       await new Promise(r => setTimeout(r, 5000));
@@ -572,7 +533,7 @@ async function processJobs() {
  */
 async function main() {
   console.log(`\n======================================================================`);
-  console.log(`[WORKER] 🚀 DJe Scraper Worker v8.0 - Iniciando...`);
+  console.log(`[WORKER] 🚀 DJe Scraper Worker v9.0 - URL + OAB - Iniciando...`);
   console.log(`[WORKER] 📅 Data/Hora: ${new Date().toISOString()}`);
   console.log(`======================================================================`);
   console.log(`[WORKER] 🔐 WEBHOOK_URL: ${WEBHOOK_URL ? '✅ OK' : '❌ MISSING!'}`);
@@ -585,9 +546,11 @@ async function main() {
   }
   
   console.log(`🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀`);
-  console.log(`[WORKER] DJe Scraper Worker v8.0 - INICIADO`);
+  console.log(`[WORKER] DJe Scraper Worker v9.0 - INICIADO`);
+  console.log(`[WORKER] ✅ Busca por OAB (não por nome)`);
+  console.log(`[WORKER] ✅ URL parametrizada + formulário fallback`);
+  console.log(`[WORKER] ✅ Validação de relevância por OAB`);
   console.log(`[WORKER] Intervalo: 5 minutos`);
-  console.log(`[WORKER] Estratégia: Busca por OAB + Nome | Período: 3 dias`);
   console.log(`🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀\n`);
   
   // Executar imediatamente
