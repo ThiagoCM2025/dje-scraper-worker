@@ -1,4 +1,4 @@
-// src/index.js - Railway Worker v4.0 - ES Module Version
+// src/index.js - Railway Worker v5.0 - Validação Estrita + Deduplicação
 import { chromium } from 'playwright';
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
@@ -7,6 +7,67 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 function formatDateBR(dateString) {
   const [year, month, day] = dateString.split('-');
   return `${day}/${month}/${year}`;
+}
+
+/**
+ * VALIDAÇÃO ESTRITA de relevância para o advogado
+ * Só aceita publicações com:
+ * 1. OAB EXATA no texto, OU
+ * 2. Nome COMPLETO exato do advogado
+ */
+function isRelevantForLawyer(text, oabNumber, lawyerName) {
+  if (!text || text.length < 50) return false;
+  
+  const upperText = text.toUpperCase();
+  const normalizedText = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase();
+  
+  // Extrair apenas dígitos da OAB
+  const oabNumOnly = oabNumber.replace(/[^0-9]/g, '');
+  
+  // Método 1: OAB EXATA no texto (múltiplos formatos)
+  const oabPatterns = [
+    new RegExp(`OAB[:\\s/]*${oabNumOnly}`, 'i'),
+    new RegExp(`OAB[:\\s/]*(SP)?[:\\s/-]*${oabNumOnly}`, 'i'),
+    new RegExp(`${oabNumOnly}[/\\s-]*SP`, 'i'),
+    new RegExp(`OAB[:\\s]*SP[:\\s/-]*${oabNumOnly}`, 'i'),
+    new RegExp(`\\b${oabNumOnly}\\b.*OAB`, 'i'),
+  ];
+  
+  for (const pattern of oabPatterns) {
+    if (pattern.test(text)) {
+      console.log(`[VALIDATION] ✅ OAB ${oabNumOnly} encontrada no texto`);
+      return true;
+    }
+  }
+  
+  // Método 2: Nome COMPLETO exato (todos os termos em sequência)
+  if (lawyerName && lawyerName.trim().length > 0) {
+    const normalizedName = lawyerName
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase().trim();
+    
+    if (normalizedText.includes(normalizedName)) {
+      console.log(`[VALIDATION] ✅ Nome completo "${lawyerName}" encontrado no texto`);
+      return true;
+    }
+  }
+  
+  // Nenhum critério atendido
+  console.log(`[VALIDATION] ❌ Publicação NÃO relevante - texto: "${text.substring(0, 80)}..."`);
+  return false;
+}
+
+/**
+ * Gera hash simples para deduplicação
+ */
+function simpleHash(text) {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString(16);
 }
 
 async function processJobs() {
@@ -37,6 +98,7 @@ async function processJobs() {
 
     for (const job of jobs) {
       console.log(`[WORKER] 🔄 Processando job: ${job.oab_number}/${job.oab_state} - ${job.target_date}`);
+      console.log(`[WORKER] 👤 Advogado: ${job.lawyer_name || 'N/A'}`);
 
       try {
         const publications = await scrapeTJSP(job);
@@ -53,13 +115,18 @@ async function processJobs() {
 }
 
 async function scrapeTJSP(job) {
-  console.log('[TJSP] 🔍 Iniciando scraping...');
+  console.log('[TJSP] 🔍 Iniciando scraping com VALIDAÇÃO ESTRITA...');
   
   const targetDate = job.target_date;
   const dateBR = formatDateBR(targetDate);
-  const searchTerm = job.lawyer_name || `OAB ${job.oab_number}`;
+  const lawyerName = job.lawyer_name || '';
+  const oabNumber = job.oab_number || '';
   
-  console.log(`[TJSP] 📋 OAB: ${job.oab_number}, Nome: ${job.lawyer_name || 'N/A'}, Data: ${targetDate}`);
+  // IMPORTANTE: Buscar pelo NOME do advogado (como Jusbrasil faz)
+  const searchTerm = lawyerName || `OAB ${oabNumber}`;
+  
+  console.log(`[TJSP] 📋 OAB: ${oabNumber}, Nome: "${lawyerName}", Data: ${targetDate}`);
+  console.log(`[TJSP] 🔎 Termo de busca: "${searchTerm}"`);
   console.log(`[TJSP] 📅 Data formatada BR: ${dateBR}`);
 
   const browser = await chromium.launch({
@@ -67,7 +134,8 @@ async function scrapeTJSP(job) {
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
   });
 
-  const publications = [];
+  const allPublications = [];
+  const seenHashes = new Set(); // Para deduplicação local
 
   try {
     const page = await browser.newPage({
@@ -86,10 +154,10 @@ async function scrapeTJSP(job) {
 
     console.log('[TJSP] 📝 Preenchendo formulário...');
     
-    // Campo pesquisa livre (editável)
+    // Campo pesquisa livre - usar NOME do advogado (como Jusbrasil)
     try {
       await page.fill('input[name="dadosConsulta.pesquisaLivre"]', searchTerm);
-      console.log('[TJSP] ✅ Campo pesquisaLivre preenchido');
+      console.log(`[TJSP] ✅ Campo pesquisaLivre preenchido com: "${searchTerm}"`);
     } catch (e) {
       await page.evaluate((term) => {
         const el = document.querySelector('input[name="dadosConsulta.pesquisaLivre"]');
@@ -97,8 +165,8 @@ async function scrapeTJSP(job) {
       }, searchTerm);
     }
 
-    // CORREÇÃO CRÍTICA: Campos de data readonly via JavaScript
-    console.log('[TJSP] 📅 Preenchendo datas via JavaScript (campos readonly)...');
+    // Campos de data readonly via JavaScript
+    console.log('[TJSP] 📅 Preenchendo datas via JavaScript...');
     
     await page.evaluate((dateValue) => {
       const dtInicio = document.querySelector('input[name="dadosConsulta.dtInicio"]');
@@ -149,70 +217,118 @@ async function scrapeTJSP(job) {
       await page.evaluate(() => { document.querySelector('form')?.submit(); });
     }
 
+    // Aguardar carregamento dos resultados
     await page.waitForTimeout(5000);
 
-    // Extrair publicações
+    // Verificar se há resultados
+    const noResults = await page.evaluate(() => {
+      const bodyText = document.body.innerText || '';
+      return bodyText.includes('Nenhum resultado') || 
+             bodyText.includes('não foram encontrad') ||
+             bodyText.includes('Não há publicações');
+    });
+
+    if (noResults) {
+      console.log('[TJSP] ℹ️ Nenhuma publicação encontrada no TJSP');
+      return [];
+    }
+
+    // Extrair publicações com múltiplos seletores
     console.log('[TJSP] 📄 Extraindo publicações...');
     
     const results = await page.evaluate(() => {
       const pubs = [];
-      const selectors = ['.fundocinza1', '.fundocinza2', '.itemTexto', 'tr.fundocinza1', 'tr.fundocinza2'];
       
-      for (const selector of selectors) {
-        document.querySelectorAll(selector).forEach(el => {
-          const text = (el.innerText || '').trim();
-          if (text.length > 100) {
+      // Lista de seletores em ordem de prioridade
+      const selectorGroups = [
+        // Seletores de conteúdo principal
+        '.conteudo-publicacao',
+        '.texto-publicacao',
+        '.itemTexto',
+        // Seletores de tabela
+        'tr.fundocinza1 td',
+        'tr.fundocinza2 td',
+        '.fundocinza1',
+        '.fundocinza2',
+        // Seletores alternativos
+        '.resultados-busca .item',
+        '.lista-resultados .item',
+        'div[class*="publicacao"]',
+        'div[class*="resultado"]'
+      ];
+      
+      for (const selector of selectorGroups) {
+        const elements = document.querySelectorAll(selector);
+        elements.forEach(el => {
+          const text = (el.innerText || el.textContent || '').trim();
+          // Só aceitar textos com tamanho significativo (conteúdo real)
+          if (text.length > 200) {
+            // Extrair número do processo se houver
             const processMatch = text.match(/(\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4})/);
-            pubs.push({ text: text.substring(0, 4000), processNumber: processMatch?.[1] || null });
+            pubs.push({ 
+              text: text.substring(0, 8000), // Texto maior para não perder dados
+              processNumber: processMatch?.[1] || null 
+            });
           }
         });
-        if (pubs.length > 0) break;
-      }
-      
-      if (pubs.length === 0) {
-        const bodyText = document.body.innerText || '';
-        if (bodyText.includes('Nenhum resultado') || bodyText.includes('não foram encontrad')) {
-          return [{ noResults: true }];
+        
+        // Se encontrou publicações neste seletor, parar
+        if (pubs.length > 0) {
+          console.log(`[TJSP] Encontrou ${pubs.length} publicações com seletor: ${selector}`);
+          break;
         }
       }
       
       return pubs;
     });
 
-    if (results.length === 1 && results[0].noResults) {
-      console.log('[TJSP] ℹ️ Nenhuma publicação encontrada');
-      return [];
-    }
+    console.log(`[TJSP] 📊 ${results.length} publicações brutas extraídas`);
 
-    console.log(`[TJSP] 📊 ${results.length} publicações brutas`);
-
+    // VALIDAÇÃO ESTRITA: Filtrar APENAS publicações relevantes
     for (const result of results) {
-      if (result.noResults) continue;
-      
-      const textLower = (result.text || '').toLowerCase();
-      
+      // Verificar relevância ANTES de adicionar
+      if (!isRelevantForLawyer(result.text, oabNumber, lawyerName)) {
+        console.log(`[TJSP] ❌ Publicação FILTRADA (não relevante para ${lawyerName || oabNumber})`);
+        continue;
+      }
+
+      // Deduplicação local via hash
+      const textHash = simpleHash(result.text);
+      if (seenHashes.has(textHash)) {
+        console.log(`[TJSP] ⚠️ Publicação duplicada ignorada`);
+        continue;
+      }
+      seenHashes.add(textHash);
+
+      // Classificar tipo
+      const textLower = result.text.toLowerCase();
       let type = 'other';
       if (textLower.includes('intimação') || textLower.includes('intimacao')) type = 'intimacao';
       else if (textLower.includes('sentença')) type = 'sentenca';
       else if (textLower.includes('despacho')) type = 'despacho';
       else if (textLower.includes('decisão')) type = 'decisao';
+      else if (textLower.includes('citação') || textLower.includes('citacao')) type = 'citacao';
 
+      // Classificar urgência
       let urgency = 'normal';
-      if (/urgente|citação/i.test(result.text)) urgency = 'critical';
-      else if (/intimação pessoal|sentença/i.test(result.text)) urgency = 'high';
+      if (/urgente|citação|prazo.*\d+.*dia/i.test(result.text)) urgency = 'critical';
+      else if (/intimação pessoal|sentença|audiência/i.test(result.text)) urgency = 'high';
 
-      publications.push({
+      allPublications.push({
         date: targetDate,
         type,
         text: result.text,
         processNumber: result.processNumber,
         urgency,
-        source: 'TJSP_RAILWAY_V4',
-        lawyers: [job.lawyer_name || `OAB ${job.oab_number}/${job.oab_state}`]
+        source: 'TJSP_RAILWAY_V5',
+        lawyers: [lawyerName || `OAB ${oabNumber}/${job.oab_state}`],
+        textHash // Enviar hash para deduplicação no webhook
       });
+
+      console.log(`[TJSP] ✅ Publicação VÁLIDA adicionada (processo: ${result.processNumber || 'N/A'})`);
     }
 
-    console.log(`[TJSP] ✅ ${publications.length} publicações processadas`);
+    console.log(`[TJSP] 🎯 RESULTADO FINAL: ${allPublications.length} publicações VÁLIDAS de ${results.length} extraídas`);
 
   } catch (error) {
     console.error('[TJSP] ❌ Erro:', error.message);
@@ -222,16 +338,17 @@ async function scrapeTJSP(job) {
     console.log('[TJSP] 🔒 Browser fechado');
   }
 
-  return publications;
+  return allPublications;
 }
 
 async function sendToWebhook(job, publications, errorMessage = null) {
-  console.log(`[WORKER] 📤 Enviando resultados...`);
+  console.log(`[WORKER] 📤 Enviando ${publications.length} publicações para webhook...`);
   
   const payload = {
     jobId: job.id,
     job_id: job.id,
     oab_number: job.oab_number,
+    lawyer_name: job.lawyer_name, // IMPORTANTE: Enviar nome para validação no webhook
     target_date: job.target_date,
     status: errorMessage ? 'failed' : 'completed',
     publications,
@@ -250,7 +367,13 @@ async function sendToWebhook(job, publications, errorMessage = null) {
     });
 
     const result = await response.json();
-    console.log(`[WORKER] ✅ Resultado:`, JSON.stringify(result));
+    console.log(`[WORKER] ✅ Webhook response:`, JSON.stringify(result));
+    
+    if (result.publicationsInserted > 0) {
+      console.log(`[WORKER] 🎉 ${result.publicationsInserted} publicações inseridas no AuraLex!`);
+    } else if (publications.length > 0) {
+      console.log(`[WORKER] ⚠️ ${publications.length} enviadas mas ${result.publicationsFiltered || 0} filtradas no webhook`);
+    }
     
   } catch (error) {
     console.error(`[WORKER] ❌ Erro webhook:`, error.message);
@@ -258,7 +381,8 @@ async function sendToWebhook(job, publications, errorMessage = null) {
 }
 
 async function main() {
-  console.log('[WORKER] 🚀 DJe Scraper Worker v4.0 iniciado');
+  console.log('[WORKER] 🚀 DJe Scraper Worker v5.0 iniciado');
+  console.log('[WORKER] ✅ Validação estrita + Deduplicação ativada');
   console.log(`[WORKER] 📡 Webhook URL: ${WEBHOOK_URL}`);
   
   await processJobs();
