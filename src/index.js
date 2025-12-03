@@ -1,653 +1,419 @@
-import { chromium } from 'playwright';
-import cron from 'node-cron';
-import { createClient } from '@supabase/supabase-js';
+const playwright = require('playwright');
 
-// ========================================
-// CONFIGURAÇÃO
-// ========================================
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://qiirmpifjyxbwnofkveq.supabase.co/functions/v1/dje-webhook-receiver';
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+// ============================================
+// WORKER v11.1 - DJEN/DataJUD
+// ============================================
+// IMPORTANTE: Este worker NÃO usa SUPABASE_SERVICE_KEY
+// Toda comunicação com Supabase é via Edge Functions
+// ============================================
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('[ERRO] Variáveis SUPABASE_URL ou SUPABASE_SERVICE_KEY não configuradas');
-  process.exit(1);
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-console.log('========================================');
-console.log('[INIT] 🚀 Railway Worker DJEN v11.0 iniciado');
-console.log('[INIT] 📅 Data:', new Date().toISOString());
-console.log('[INIT] 🔗 Webhook:', WEBHOOK_URL);
-console.log('[INIT] ⚠️  IMPORTANTE: O DJE TJSP (dje.tjsp.jus.br) foi DESCONTINUADO em 22/07/2025');
-console.log('[INIT] ✅ Agora usando DJEN (comunica.pje.jus.br) - Sistema Nacional do CNJ');
-console.log('========================================');
-
-// ========================================
-// FUNÇÕES AUXILIARES
-// ========================================
-
-function formatarDataBR(date) {
-  const dia = String(date.getDate()).padStart(2, '0');
-  const mes = String(date.getMonth() + 1).padStart(2, '0');
-  const ano = date.getFullYear();
-  return `${dia}/${mes}/${ano}`;
-}
-
-function formatarDataISO(date) {
-  return date.toISOString().split('T')[0];
-}
-
-function extrairNumeroProcesso(texto) {
-  const match = texto.match(/\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/);
-  return match ? match[0] : null;
-}
-
-function identificarTipo(texto) {
-  const textoLower = texto.toLowerCase();
-  if (textoLower.includes('intimação') || textoLower.includes('intimacao') || textoLower.includes('intimado')) return 'intimacao';
-  if (textoLower.includes('citação') || textoLower.includes('citacao') || textoLower.includes('citado')) return 'citacao';
-  if (textoLower.includes('decisão') || textoLower.includes('decisao')) return 'decisao';
-  if (textoLower.includes('sentença') || textoLower.includes('sentenca')) return 'sentenca';
-  if (textoLower.includes('despacho')) return 'despacho';
-  if (textoLower.includes('juntada')) return 'juntada';
-  return 'outros';
-}
-
-function classificarUrgencia(texto) {
-  const textoLower = texto.toLowerCase();
+const CONFIG = {
+  // URLs das Edge Functions (autenticação via WEBHOOK_SECRET)
+  GET_JOBS_URL: `${process.env.SUPABASE_URL}/functions/v1/dje-get-pending-jobs`,
+  WEBHOOK_URL: `${process.env.SUPABASE_URL}/functions/v1/dje-webhook-receiver`,
   
-  const criticalKeywords = ['urgente', 'urgência', 'imediato', 'citação', 'prazo fatal'];
-  const highKeywords = ['intimação pessoal', 'sentença', 'decisão'];
+  // Credenciais
+  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,
+  DATAJUD_API_KEY: process.env.DATAJUD_API_KEY || null,
   
-  if (criticalKeywords.some(k => textoLower.includes(k))) return 'critical';
-  if (highKeywords.some(k => textoLower.includes(k))) return 'high';
+  // Configurações
+  CHECK_INTERVAL: 5 * 60 * 1000, // 5 minutos
+  MAX_RETRIES: 3,
   
-  const prazoMatch = texto.match(/prazo\s+de\s+(\d+)\s+dias?/i);
-  if (prazoMatch) {
-    const days = parseInt(prazoMatch[1]);
-    if (days <= 3) return 'critical';
-    if (days <= 7) return 'high';
-    if (days <= 15) return 'normal';
+  // URLs dos sistemas
+  DJEN_URL: 'https://comunica.pje.jus.br/',
+  DIARIO_CNJ_URL: 'https://diario.cnj.jus.br/',
+  DATAJUD_API_URL: 'https://api-publica.datajud.cnj.jus.br/'
+};
+
+// ============================================
+// VALIDAÇÃO DE AMBIENTE (SEM SERVICE_KEY!)
+// ============================================
+function validarAmbiente() {
+  const erros = [];
+  
+  if (!process.env.SUPABASE_URL) {
+    erros.push('SUPABASE_URL não configurada');
   }
   
-  return 'normal';
-}
-
-function validarConteudoJuridico(texto) {
-  const palavrasChave = [
-    'advogado', 'advogada', 'oab', 'processo', 'autos',
-    'intimação', 'intimacao', 'citação', 'citacao',
-    'sentença', 'sentenca', 'decisão', 'decisao',
-    'despacho', 'prazo', 'requerente', 'requerido',
-    'autor', 'réu', 'apelante', 'apelado'
-  ];
-  
-  const textoLower = texto.toLowerCase();
-  return palavrasChave.some(palavra => textoLower.includes(palavra));
-}
-
-function gerarHashPublicacao(texto) {
-  let hash = 0;
-  for (let i = 0; i < texto.length; i++) {
-    const char = texto.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
+  if (!process.env.WEBHOOK_SECRET) {
+    erros.push('WEBHOOK_SECRET não configurada');
   }
-  return Math.abs(hash).toString(16);
+  
+  // NOTA: SUPABASE_SERVICE_KEY NÃO é necessária!
+  // O Worker usa apenas Edge Functions com WEBHOOK_SECRET
+  
+  if (erros.length > 0) {
+    console.error('========================================');
+    console.error('[ERRO] Configuração incompleta:');
+    erros.forEach(e => console.error(`  - ${e}`));
+    console.error('========================================');
+    console.error('Variáveis necessárias:');
+    console.error('  - SUPABASE_URL: URL do projeto Supabase');
+    console.error('  - WEBHOOK_SECRET: Secret para autenticação com Edge Functions');
+    console.error('  - DATAJUD_API_KEY: (opcional) Chave da API DataJUD');
+    console.error('========================================');
+    return false;
+  }
+  
+  console.log('========================================');
+  console.log('[OK] Ambiente configurado corretamente');
+  console.log(`  SUPABASE_URL: ${process.env.SUPABASE_URL?.substring(0, 30)}...`);
+  console.log(`  WEBHOOK_SECRET: ${process.env.WEBHOOK_SECRET ? '***configurado***' : 'NÃO CONFIGURADO'}`);
+  console.log(`  DATAJUD_API_KEY: ${process.env.DATAJUD_API_KEY ? '***configurado***' : 'não configurado (opcional)'}`);
+  console.log('========================================');
+  return true;
 }
 
-// ========================================
-// SCRAPER DJEN (SISTEMA NACIONAL DO CNJ)
-// ========================================
-
-async function scraperDJEN(oabNumber, lawyerName, dataPublicacao) {
-  console.log(`\n[DJEN] 🚀 INICIANDO SCRAPING NO SISTEMA NACIONAL`);
-  console.log(`[DJEN] 📋 OAB: ${oabNumber}`);
-  console.log(`[DJEN] 👤 Advogado: ${lawyerName || 'N/A'}`);
-  console.log(`[DJEN] 📅 Data: ${dataPublicacao}`);
+// ============================================
+// BUSCAR JOBS PENDENTES (via Edge Function)
+// ============================================
+async function buscarJobsPendentes() {
+  console.log('[JOBS] Buscando jobs pendentes via Edge Function...');
   
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-accelerated-2d-canvas'
-    ]
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1920, height: 1080 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  });
-
-  const page = await context.newPage();
-  const publicacoesEncontradas = [];
-  const hashesVistos = new Set();
-
   try {
-    // ========================================
-    // ESTRATÉGIA 1: DJEN - comunica.pje.jus.br
-    // ========================================
-    console.log(`\n[DJEN] 📡 Tentando DJEN (comunica.pje.jus.br)...`);
+    const response = await fetch(CONFIG.GET_JOBS_URL, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-webhook-secret': CONFIG.WEBHOOK_SECRET
+      }
+    });
     
-    try {
-      await page.goto('https://comunica.pje.jus.br/', {
-        waitUntil: 'networkidle',
-        timeout: 45000
-      });
-
-      console.log('[DJEN] ✅ Página DJEN carregada');
-      console.log('[DJEN] 🔍 URL atual:', page.url());
-
-      // Aguardar carregamento completo
-      await page.waitForTimeout(3000);
-
-      // Verificar se há formulário de busca
-      const temFormulario = await page.$('input[type="text"], input[type="search"], #search, .search-input');
-      
-      if (temFormulario) {
-        console.log('[DJEN] 📝 Formulário de busca encontrado');
-        
-        // Tentar preencher campo de busca com OAB
-        const campoBusca = await page.$('input[type="text"], input[type="search"], #search, .search-input, input[name*="pesquisa"], input[name*="search"]');
-        
-        if (campoBusca) {
-          // Buscar por número OAB
-          await campoBusca.fill(oabNumber);
-          console.log(`[DJEN] ✅ Campo preenchido com OAB: ${oabNumber}`);
-          
-          // Tentar preencher campos de data se existirem
-          const campoDataInicio = await page.$('input[type="date"], input[name*="dataInicio"], input[name*="dtInicio"], #dataInicio');
-          const campoDataFim = await page.$('input[type="date"], input[name*="dataFim"], input[name*="dtFim"], #dataFim');
-          
-          if (campoDataInicio && campoDataFim) {
-            await campoDataInicio.fill(formatarDataISO(new Date()));
-            await campoDataFim.fill(formatarDataISO(new Date()));
-            console.log('[DJEN] ✅ Campos de data preenchidos');
-          }
-          
-          // Selecionar tribunal TJSP se houver opção
-          const seletorTribunal = await page.$('select[name*="tribunal"], select[name*="orgao"], #tribunal');
-          if (seletorTribunal) {
-            const opcoes = await seletorTribunal.$$eval('option', opts => 
-              opts.map(o => ({ value: o.value, text: o.textContent }))
-            );
-            
-            const opcaoTJSP = opcoes.find(o => 
-              o.text.includes('TJSP') || 
-              o.text.includes('São Paulo') || 
-              o.value.includes('TJSP') ||
-              o.value.includes('8.26')
-            );
-            
-            if (opcaoTJSP) {
-              await seletorTribunal.selectOption(opcaoTJSP.value);
-              console.log('[DJEN] ✅ TJSP selecionado');
-            }
-          }
-          
-          await page.waitForTimeout(1000);
-          
-          // Clicar no botão de buscar
-          const botaoBuscar = await page.$('button[type="submit"], input[type="submit"], button:has-text("Pesquisar"), button:has-text("Buscar"), .btn-search, #btnPesquisar');
-          
-          if (botaoBuscar) {
-            await botaoBuscar.click();
-            console.log('[DJEN] 🔍 Busca executada');
-            
-            // Aguardar resultados
-            await page.waitForTimeout(5000);
-            
-            // Extrair publicações
-            const resultados = await page.evaluate(() => {
-              const items = [];
-              
-              // Tentar múltiplos seletores
-              const seletores = [
-                '.resultado-item',
-                '.publicacao',
-                '.item-publicacao',
-                '[class*="resultado"]',
-                '[class*="publicacao"]',
-                'table tbody tr',
-                '.card',
-                '.list-item'
-              ];
-              
-              for (const seletor of seletores) {
-                const elementos = document.querySelectorAll(seletor);
-                if (elementos.length > 0) {
-                  elementos.forEach(el => {
-                    const texto = el.innerText || el.textContent || '';
-                    if (texto.length > 50) {
-                      items.push({
-                        texto: texto.substring(0, 3000),
-                        html: el.innerHTML
-                      });
-                    }
-                  });
-                  break;
-                }
-              }
-              
-              return items;
-            });
-            
-            console.log(`[DJEN] 📊 ${resultados.length} resultados brutos encontrados`);
-            
-            for (const resultado of resultados) {
-              const hash = gerarHashPublicacao(resultado.texto);
-              if (hashesVistos.has(hash)) continue;
-              if (!validarConteudoJuridico(resultado.texto)) continue;
-              
-              // Validar se contém OAB ou nome do advogado
-              const textoLower = resultado.texto.toLowerCase();
-              const contemOAB = textoLower.includes(oabNumber.toLowerCase()) || 
-                               textoLower.includes(`oab/${oabNumber}`) ||
-                               textoLower.includes(`oab ${oabNumber}`);
-              const contemNome = lawyerName && textoLower.includes(lawyerName.toLowerCase());
-              
-              if (!contemOAB && !contemNome) continue;
-              
-              hashesVistos.add(hash);
-              
-              publicacoesEncontradas.push({
-                texto: resultado.texto,
-                numeroProcesso: extrairNumeroProcesso(resultado.texto),
-                tipo: identificarTipo(resultado.texto),
-                urgencia: classificarUrgencia(resultado.texto),
-                dataPublicacao: dataPublicacao,
-                fonte: 'DJEN',
-                tribunal: 'TJSP',
-                hash: hash
-              });
-            }
-          }
-        }
-      } else {
-        console.log('[DJEN] ⚠️ Formulário de busca não encontrado na página principal');
-        
-        // Tentar capturar estrutura da página para debug
-        const estrutura = await page.evaluate(() => {
-          return {
-            title: document.title,
-            forms: document.querySelectorAll('form').length,
-            inputs: document.querySelectorAll('input').length,
-            buttons: document.querySelectorAll('button').length
-          };
-        });
-        
-        console.log('[DJEN] 📋 Estrutura da página:', JSON.stringify(estrutura));
-      }
-      
-    } catch (djenError) {
-      console.log(`[DJEN] ⚠️ Erro ao acessar DJEN: ${djenError.message}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[JOBS] Erro HTTP ${response.status}: ${errorText}`);
+      return [];
     }
-
-    // ========================================
-    // ESTRATÉGIA 2: DataJUD API (Fallback)
-    // ========================================
-    if (publicacoesEncontradas.length === 0) {
-      console.log(`\n[DATAJUD] 📡 Tentando DataJUD API como fallback...`);
-      
-      try {
-        const DATAJUD_API_KEY = process.env.DATAJUD_API_KEY;
-        
-        if (DATAJUD_API_KEY) {
-          // Buscar no DataJUD por movimentações de intimação
-          const dataISO = formatarDataISO(new Date());
-          const dataInicio = new Date();
-          dataInicio.setDate(dataInicio.getDate() - 7); // Últimos 7 dias
-          
-          const response = await fetch('https://api-publica.datajud.cnj.jus.br/api_publica_tjsp/_search', {
-            method: 'POST',
-            headers: {
-              'Authorization': `APIKey ${DATAJUD_API_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              size: 100,
-              query: {
-                bool: {
-                  must: [
-                    {
-                      nested: {
-                        path: "movimentos",
-                        query: {
-                          bool: {
-                            should: [
-                              { match: { "movimentos.nome": "intimação" } },
-                              { match: { "movimentos.nome": "intimado" } },
-                              { match: { "movimentos.nome": "ciência" } }
-                            ],
-                            minimum_should_match: 1
-                          }
-                        }
-                      }
-                    },
-                    {
-                      range: {
-                        "dataAjuizamento": {
-                          gte: dataInicio.toISOString().split('T')[0],
-                          lte: dataISO
-                        }
-                      }
-                    }
-                  ],
-                  should: [
-                    { match_phrase: { "silesAdvogados.nome": lawyerName || oabNumber } }
-                  ]
-                }
-              },
-              _source: ["numeroProcesso", "classe", "assuntos", "movimentos", "dataAjuizamento"]
-            })
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            const hits = data.hits?.hits || [];
-            
-            console.log(`[DATAJUD] 📊 ${hits.length} processos encontrados`);
-            
-            for (const hit of hits) {
-              const processo = hit._source;
-              const movimentos = processo.movimentos || [];
-              
-              // Filtrar apenas movimentos de intimação recentes
-              const intimacoes = movimentos.filter(m => {
-                const nomeMovimento = (m.nome || '').toLowerCase();
-                return nomeMovimento.includes('intimação') || 
-                       nomeMovimento.includes('intimado') ||
-                       nomeMovimento.includes('ciência');
-              });
-              
-              for (const intimacao of intimacoes) {
-                const textoCompleto = `
-                  Processo: ${processo.numeroProcesso}
-                  Classe: ${processo.classe?.nome || 'N/A'}
-                  Movimento: ${intimacao.nome}
-                  Complemento: ${intimacao.complemento || ''}
-                `.trim();
-                
-                const hash = gerarHashPublicacao(textoCompleto);
-                if (hashesVistos.has(hash)) continue;
-                
-                hashesVistos.add(hash);
-                
-                publicacoesEncontradas.push({
-                  texto: textoCompleto,
-                  numeroProcesso: processo.numeroProcesso,
-                  tipo: identificarTipo(intimacao.nome),
-                  urgencia: classificarUrgencia(textoCompleto),
-                  dataPublicacao: intimacao.dataHora || dataPublicacao,
-                  fonte: 'DATAJUD',
-                  tribunal: 'TJSP',
-                  hash: hash
-                });
-              }
-            }
-          } else {
-            console.log(`[DATAJUD] ⚠️ API retornou status ${response.status}`);
-          }
-        } else {
-          console.log('[DATAJUD] ⚠️ DATAJUD_API_KEY não configurada');
-        }
-        
-      } catch (datajudError) {
-        console.log(`[DATAJUD] ⚠️ Erro na API DataJUD: ${datajudError.message}`);
-      }
-    }
-
-    // ========================================
-    // ESTRATÉGIA 3: diario.cnj.jus.br (Fallback 2)
-    // ========================================
-    if (publicacoesEncontradas.length === 0) {
-      console.log(`\n[DIARIO-CNJ] 📡 Tentando diario.cnj.jus.br como fallback final...`);
-      
-      try {
-        await page.goto('https://diario.cnj.jus.br/', {
-          waitUntil: 'networkidle',
-          timeout: 45000
-        });
-
-        console.log('[DIARIO-CNJ] ✅ Página carregada');
-        await page.waitForTimeout(3000);
-
-        // Extrair informações da estrutura da página
-        const estrutura = await page.evaluate(() => {
-          return {
-            title: document.title,
-            url: window.location.href,
-            forms: Array.from(document.querySelectorAll('form')).map(f => ({
-              id: f.id,
-              action: f.action,
-              method: f.method
-            })),
-            inputs: Array.from(document.querySelectorAll('input')).map(i => ({
-              name: i.name,
-              id: i.id,
-              type: i.type
-            }))
-          };
-        });
-        
-        console.log('[DIARIO-CNJ] 📋 Estrutura:', JSON.stringify(estrutura, null, 2));
-        
-      } catch (diarioError) {
-        console.log(`[DIARIO-CNJ] ⚠️ Erro: ${diarioError.message}`);
-      }
-    }
-
+    
+    const data = await response.json();
+    const jobs = data.jobs || [];
+    
+    console.log(`[JOBS] ${jobs.length} job(s) encontrado(s)`);
+    return jobs;
+    
   } catch (error) {
-    console.error(`[SCRAPER] ❌ Erro geral no scraping:`, error.message);
-    throw error;
-  } finally {
-    await browser.close();
-    console.log('[SCRAPER] 🔒 Browser fechado');
+    console.error('[JOBS] Erro ao buscar jobs:', error.message);
+    return [];
   }
-
-  console.log(`\n[SCRAPER] 🎯 RESULTADO FINAL: ${publicacoesEncontradas.length} publicações únicas`);
-  return publicacoesEncontradas;
 }
 
-// ========================================
-// ENVIAR RESULTADOS PARA WEBHOOK
-// ========================================
-
-async function enviarParaWebhook(jobId, oabNumber, lawyerName, publicacoes, dataPublicacao, monitoringId) {
-  console.log(`\n[WEBHOOK] 📤 Enviando ${publicacoes.length} publicações para webhook`);
-  console.log(`[WEBHOOK] 🌐 URL: ${WEBHOOK_URL}`);
+// ============================================
+// ENVIAR RESULTADOS (via Edge Function)
+// ============================================
+async function enviarResultados(jobId, publications, error = null) {
+  console.log(`[WEBHOOK] Enviando resultados do job ${jobId}...`);
   
   try {
     const payload = {
       job_id: jobId,
-      monitoring_id: monitoringId,
-      oab_number: oabNumber,
-      lawyer_name: lawyerName,
-      search_date: dataPublicacao,
-      tribunal: 'TJSP',
+      success: !error,
+      publications: publications || [],
+      error_message: error,
       source: 'DJEN_V11',
-      publications: publicacoes.map(pub => ({
-        text: pub.texto,
-        date: pub.dataPublicacao,
-        process_number: pub.numeroProcesso,
-        type: pub.tipo,
-        urgency: pub.urgencia,
-        source: pub.fonte,
-        hash: pub.hash
-      })),
-      total: publicacoes.length,
-      timestamp: new Date().toISOString(),
-      worker_version: 'v11.0-DJEN'
+      worker_version: 'v11.1-DJEN',
+      scraped_at: new Date().toISOString()
     };
-
-    const response = await fetch(WEBHOOK_URL, {
+    
+    const response = await fetch(CONFIG.WEBHOOK_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-webhook-secret': WEBHOOK_SECRET
+        'x-webhook-secret': CONFIG.WEBHOOK_SECRET
       },
       body: JSON.stringify(payload)
     });
-
-    const responseText = await response.text();
-    console.log(`[WEBHOOK] 📨 Response status: ${response.status}`);
     
-    let result;
-    try {
-      result = JSON.parse(responseText);
-    } catch {
-      result = { raw: responseText };
-    }
-
     if (!response.ok) {
-      throw new Error(`Webhook retornou status ${response.status}: ${responseText}`);
+      const errorText = await response.text();
+      console.error(`[WEBHOOK] Erro HTTP ${response.status}: ${errorText}`);
+      return false;
     }
-
-    console.log(`[WEBHOOK] ✅ Resultados enviados:`, JSON.stringify(result));
-    return result;
-
+    
+    console.log(`[WEBHOOK] Resultados enviados com sucesso`);
+    return true;
+    
   } catch (error) {
-    console.error(`[WEBHOOK] ❌ Erro ao enviar:`, error.message);
-    throw error;
+    console.error('[WEBHOOK] Erro ao enviar resultados:', error.message);
+    return false;
   }
 }
 
-// ========================================
-// PROCESSAR JOBS PENDENTES
-// ========================================
-
-async function processarJobs() {
-  console.log('\n========================================');
-  console.log('[WORKER] 🔄 Buscando jobs pendentes...');
-  console.log('[WORKER] 📅 Horário:', new Date().toISOString());
+// ============================================
+// SCRAPING DO DJEN (comunica.pje.jus.br)
+// ============================================
+async function scrapeDJEN(browser, job) {
+  console.log(`[DJEN] Iniciando scraping para OAB: ${job.oab_number}`);
+  
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+  });
+  const page = await context.newPage();
+  const publications = [];
   
   try {
-    const { data: jobs, error } = await supabase
-      .from('dje_scraping_queue')
-      .select('*')
-      .eq('status', 'pending')
-      .lt('retry_count', 3)
-      .order('created_at', { ascending: true })
-      .limit(5);
-
-    if (error) {
-      console.error('[WORKER] ❌ Erro ao buscar jobs:', error.message);
-      return;
-    }
-
-    if (!jobs || jobs.length === 0) {
-      console.log('[WORKER] ℹ️ Nenhum job pendente');
-      return;
-    }
-
-    console.log(`[WORKER] ✅ ${jobs.length} jobs encontrados para processar`);
-
-    for (const job of jobs) {
-      console.log(`\n[WORKER] 🔨 Processando Job ID: ${job.id}`);
-      console.log(`[WORKER]    OAB: ${job.oab_number}`);
-      console.log(`[WORKER]    Advogado: ${job.lawyer_name || 'N/A'}`);
-      console.log(`[WORKER]    Data: ${job.search_date || 'hoje'}`);
-      console.log(`[WORKER]    Tentativa: ${(job.retry_count || 0) + 1}/3`);
-      
-      // Marcar como processando
-      await supabase
-        .from('dje_scraping_queue')
-        .update({ 
-          status: 'processing',
-          started_at: new Date().toISOString()
-        })
-        .eq('id', job.id);
-
-      try {
-        // Definir data de busca
-        const hoje = new Date();
-        const dataPublicacao = job.search_date || formatarDataBR(hoje);
-        
-        // Executar scraping
-        const publicacoes = await scraperDJEN(
-          job.oab_number, 
-          job.lawyer_name,
-          dataPublicacao
-        );
-
-        // Enviar para webhook
-        await enviarParaWebhook(
-          job.id,
-          job.oab_number,
-          job.lawyer_name,
-          publicacoes,
-          dataPublicacao,
-          job.monitoring_id
-        );
-
-        // Marcar como completo
-        await supabase
-          .from('dje_scraping_queue')
-          .update({ 
-            status: 'completed',
-            completed_at: new Date().toISOString(),
-            result: { 
-              publications_found: publicacoes.length,
-              source: 'DJEN_V11',
-              worker_version: 'v11.0'
-            }
-          })
-          .eq('id', job.id);
-
-        console.log(`[WORKER] ✅ Job ${job.id} concluído: ${publicacoes.length} publicações`);
-
-      } catch (error) {
-        console.error(`[WORKER] ❌ Erro no Job ${job.id}:`, error.message);
-        
-        // Incrementar retry
-        await supabase
-          .from('dje_scraping_queue')
-          .update({ 
-            status: 'pending',
-            retry_count: (job.retry_count || 0) + 1,
-            error_message: error.message
-          })
-          .eq('id', job.id);
+    // Acessar DJEN
+    console.log(`[DJEN] Acessando ${CONFIG.DJEN_URL}...`);
+    await page.goto(CONFIG.DJEN_URL, { 
+      waitUntil: 'domcontentloaded',
+      timeout: 30000 
+    });
+    
+    await page.waitForTimeout(3000);
+    
+    // Tentar encontrar campos de busca
+    const searchSelectors = [
+      'input[name*="oab"]',
+      'input[name*="advogado"]',
+      'input[id*="oab"]',
+      'input[id*="advogado"]',
+      'input[placeholder*="OAB"]',
+      'input[placeholder*="advogado"]',
+      '#pesquisaLivre',
+      'input[type="text"]'
+    ];
+    
+    let searchField = null;
+    for (const selector of searchSelectors) {
+      const element = await page.$(selector);
+      if (element) {
+        searchField = element;
+        console.log(`[DJEN] Campo de busca encontrado: ${selector}`);
+        break;
       }
     }
-
+    
+    if (searchField) {
+      // Preencher busca
+      const searchTerm = job.lawyer_name || job.oab_number;
+      await searchField.fill(searchTerm);
+      console.log(`[DJEN] Termo de busca: ${searchTerm}`);
+      
+      // Tentar submeter
+      const submitButton = await page.$('button[type="submit"], input[type="submit"], button:has-text("Pesquisar"), button:has-text("Buscar")');
+      if (submitButton) {
+        await submitButton.click();
+        await page.waitForTimeout(5000);
+      }
+      
+      // Extrair resultados
+      const results = await page.$$('div.resultado, div.publicacao, tr.resultado, .intimacao, .publicacao-item');
+      console.log(`[DJEN] ${results.length} resultados encontrados`);
+      
+      for (const result of results) {
+        try {
+          const text = await result.textContent();
+          if (text && text.length > 50) {
+            const dateMatch = text.match(/(\d{2}\/\d{2}\/\d{4})/);
+            publications.push({
+              text: text.trim().substring(0, 5000),
+              date: dateMatch ? dateMatch[1] : new Date().toLocaleDateString('pt-BR'),
+              source: 'DJEN',
+              tribunal: 'TJSP',
+              type: 'intimacao'
+            });
+          }
+        } catch (e) {
+          // Ignorar erros de extração individual
+        }
+      }
+    } else {
+      console.log('[DJEN] Campo de busca não encontrado, tentando extrair conteúdo geral...');
+      
+      // Capturar screenshot para debug
+      await page.screenshot({ path: '/tmp/djen_debug.png' });
+      console.log('[DJEN] Screenshot salvo em /tmp/djen_debug.png');
+    }
+    
   } catch (error) {
-    console.error('[WORKER] ❌ Erro geral:', error);
+    console.error('[DJEN] Erro no scraping:', error.message);
+  } finally {
+    await context.close();
   }
   
-  console.log('');
-  console.log('[WORKER] ✅ Ciclo concluído.');
-  console.log('');
-  console.log('[WORKER] ♾️ Próxima execução em 5 minutos...');
+  return publications;
 }
 
-// ========================================
-// CRON JOB - A CADA 5 MINUTOS
-// ========================================
+// ============================================
+// FALLBACK: API DATAJUD
+// ============================================
+async function buscarDataJUD(job) {
+  if (!CONFIG.DATAJUD_API_KEY) {
+    console.log('[DATAJUD] API Key não configurada, pulando fallback');
+    return [];
+  }
+  
+  console.log(`[DATAJUD] Buscando movimentações para: ${job.lawyer_name || job.oab_number}`);
+  
+  const publications = [];
+  
+  try {
+    // DataJUD usa Elasticsearch
+    const searchBody = {
+      size: 20,
+      query: {
+        bool: {
+          should: [
+            { match: { "movimentos.complementosTabelados.descricao": "intimação" }},
+            { match: { "movimentos.complementosTabelados.descricao": "citação" }},
+            { match: { "dadosBasicos.polo_ativo": job.lawyer_name || "" }},
+            { match: { "dadosBasicos.polo_passivo": job.lawyer_name || "" }}
+          ],
+          minimum_should_match: 1
+        }
+      },
+      sort: [{ "dataAjuizamento": { order: "desc" }}]
+    };
+    
+    // Endpoint do TJSP no DataJUD
+    const endpoint = `${CONFIG.DATAJUD_API_URL}api_publica_tjsp/_search`;
+    
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `APIKey ${CONFIG.DATAJUD_API_KEY}`
+      },
+      body: JSON.stringify(searchBody)
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      const hits = data.hits?.hits || [];
+      
+      console.log(`[DATAJUD] ${hits.length} processos encontrados`);
+      
+      for (const hit of hits) {
+        const source = hit._source;
+        const movimentos = source.movimentos || [];
+        
+        for (const mov of movimentos) {
+          const descricao = mov.complementosTabelados?.map(c => c.descricao).join(' ') || '';
+          if (descricao.toLowerCase().includes('intimação') || 
+              descricao.toLowerCase().includes('citação')) {
+            publications.push({
+              text: `${source.numeroProcesso} - ${descricao}`,
+              date: mov.dataHora?.substring(0, 10) || new Date().toISOString().substring(0, 10),
+              source: 'DATAJUD',
+              tribunal: 'TJSP',
+              type: 'movimentacao',
+              process_number: source.numeroProcesso
+            });
+          }
+        }
+      }
+    } else {
+      console.error(`[DATAJUD] Erro HTTP ${response.status}`);
+    }
+    
+  } catch (error) {
+    console.error('[DATAJUD] Erro na busca:', error.message);
+  }
+  
+  return publications;
+}
 
-console.log('[CRON] ⏰ Configurando CRON job a cada 5 minutos');
+// ============================================
+// PROCESSAR UM JOB
+// ============================================
+async function processarJob(browser, job) {
+  console.log('========================================');
+  console.log(`[JOB] Processando job ${job.id}`);
+  console.log(`  OAB: ${job.oab_number}`);
+  console.log(`  Advogado: ${job.lawyer_name || 'N/A'}`);
+  console.log(`  Tribunal: ${job.tribunal || 'TJSP'}`);
+  console.log('========================================');
+  
+  let publications = [];
+  let error = null;
+  
+  try {
+    // Estratégia 1: Scraping DJEN
+    publications = await scrapeDJEN(browser, job);
+    console.log(`[JOB] DJEN retornou ${publications.length} publicações`);
+    
+    // Estratégia 2: Fallback para DataJUD se DJEN não retornou nada
+    if (publications.length === 0) {
+      console.log('[JOB] DJEN sem resultados, tentando DataJUD...');
+      publications = await buscarDataJUD(job);
+      console.log(`[JOB] DataJUD retornou ${publications.length} publicações`);
+    }
+    
+  } catch (e) {
+    console.error('[JOB] Erro ao processar:', e.message);
+    error = e.message;
+  }
+  
+  // Enviar resultados
+  await enviarResultados(job.id, publications, error);
+  
+  console.log(`[JOB] Job ${job.id} finalizado`);
+  console.log('========================================');
+}
 
-cron.schedule('*/5 * * * *', async () => {
-  await processarJobs();
-});
+// ============================================
+// LOOP PRINCIPAL
+// ============================================
+async function main() {
+  console.log('========================================');
+  console.log('🚀 DJE SCRAPER WORKER v11.1 - DJEN/DataJUD');
+  console.log('========================================');
+  console.log('IMPORTANTE: Este worker usa apenas Edge Functions');
+  console.log('NÃO requer SUPABASE_SERVICE_KEY');
+  console.log('========================================');
+  
+  // Validar ambiente
+  if (!validarAmbiente()) {
+    console.error('[FATAL] Ambiente inválido, encerrando...');
+    process.exit(1);
+  }
+  
+  // Iniciar browser
+  console.log('[BROWSER] Iniciando Playwright...');
+  const browser = await playwright.chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+  console.log('[BROWSER] Browser iniciado com sucesso');
+  
+  // Loop de processamento
+  const processarFila = async () => {
+    console.log('\n[WORKER] Verificando fila de jobs...');
+    
+    try {
+      const jobs = await buscarJobsPendentes();
+      
+      if (jobs.length === 0) {
+        console.log('[WORKER] Nenhum job pendente');
+        return;
+      }
+      
+      for (const job of jobs) {
+        await processarJob(browser, job);
+      }
+      
+    } catch (error) {
+      console.error('[WORKER] Erro no processamento:', error.message);
+    }
+  };
+  
+  // Executar imediatamente
+  await processarFila();
+  
+  // Agendar verificações periódicas
+  console.log(`[WORKER] Próxima verificação em ${CONFIG.CHECK_INTERVAL / 60000} minutos`);
+  setInterval(processarFila, CONFIG.CHECK_INTERVAL);
+  
+  // Manter processo vivo
+  process.on('SIGTERM', async () => {
+    console.log('[WORKER] Recebido SIGTERM, encerrando...');
+    await browser.close();
+    process.exit(0);
+  });
+}
 
-// Executar imediatamente na inicialização
-console.log('[INIT] 🚀 Executando primeira verificação...');
-processarJobs();
-
-// Manter o processo vivo
-process.on('SIGTERM', () => {
-  console.log('[SHUTDOWN] 🛑 Recebido SIGTERM, encerrando...');
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('[SHUTDOWN] 🛑 Recebido SIGINT, encerrando...');
-  process.exit(0);
+// Iniciar
+main().catch(error => {
+  console.error('[FATAL] Erro não tratado:', error);
+  process.exit(1);
 });
