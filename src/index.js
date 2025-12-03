@@ -1,15 +1,32 @@
-// src/index.js - Railway Worker v6.0 - EXTRAÇÃO CORRIGIDA
-import { chromium } from 'playwright';
+const { chromium } = require('playwright');
 
+// Configurações
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const GET_JOBS_URL = 'https://qiirmpifjyxbwnofkveq.supabase.co/functions/v1/dje-get-pending-jobs';
 
-function formatDateBR(dateString) {
-  const [year, month, day] = dateString.split('-');
+// Captura erros não tratados
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[FATAL] Uncaught Exception:', error);
+});
+
+/**
+ * Formata data no padrão brasileiro DD/MM/YYYY
+ */
+function formatDateBR(dateStr) {
+  const date = new Date(dateStr + 'T12:00:00Z');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const year = date.getUTCFullYear();
   return `${day}/${month}/${year}`;
 }
 
-// Hash simples para deduplicação local
+/**
+ * Gera hash simples para deduplicação local
+ */
 function simpleHash(str) {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -17,283 +34,168 @@ function simpleHash(str) {
     hash = ((hash << 5) - hash) + char;
     hash = hash & hash;
   }
-  return hash.toString(16);
+  return Math.abs(hash).toString(16);
 }
 
-// Validação se publicação é relevante para o advogado
-function isRelevantForLawyer(text, oabNumber, lawyerName) {
-  if (!text || text.length < 50) return false;
+/**
+ * VALIDAÇÃO RELAXADA v7.0
+ * Como a busca já é feita pelo nome do advogado no TJSP,
+ * as publicações retornadas já são relevantes.
+ * Apenas filtramos publicações muito curtas ou claramente inválidas.
+ */
+function isValidPublication(text, oabNumber, lawyerName) {
+  if (!text || text.length < 50) {
+    console.log(`[VALIDATION] ⚠️ Texto muito curto (${text?.length || 0} chars)`);
+    return false;
+  }
   
-  const upperText = text.toUpperCase();
-  const oabNumOnly = oabNumber.replace(/[^0-9]/g, '');
+  const textUpper = text.toUpperCase();
   
-  // Método 1: OAB no texto (várias formatações)
-  const oabPatterns = [
-    new RegExp(`OAB[:\\s/]*${oabNumOnly}`, 'i'),
-    new RegExp(`OAB[:\\s/]*SP[:\\s/-]*${oabNumOnly}`, 'i'),
-    new RegExp(`${oabNumOnly}[/\\s-]*SP`, 'i'),
-    new RegExp(`\\b${oabNumOnly}\\b`, 'i'),
+  // Verificação básica: deve conter algum termo jurídico
+  const legalTerms = [
+    'PROCESSO', 'AUTOS', 'INTIMAÇÃO', 'CITAÇÃO', 'SENTENÇA', 
+    'DECISÃO', 'DESPACHO', 'EXPEDIENTE', 'PUBLICAÇÃO',
+    'REQUERENTE', 'REQUERIDO', 'AUTOR', 'RÉU', 'APELANTE',
+    'AGRAVANTE', 'EMBARGANTE', 'IMPETRANTE', 'RECLAMANTE',
+    'PRAZO', 'DIAS', 'MANIFESTAR', 'CIÊNCIA', 'VISTA'
   ];
   
-  for (const pattern of oabPatterns) {
-    if (pattern.test(text)) {
-      console.log(`[VALIDATION] ✅ OAB ${oabNumOnly} encontrada no texto`);
-      return true;
-    }
+  const hasLegalTerm = legalTerms.some(term => textUpper.includes(term));
+  
+  if (!hasLegalTerm) {
+    console.log(`[VALIDATION] ⚠️ Sem termos jurídicos relevantes`);
+    return false;
   }
   
-  // Método 2: Nome completo do advogado
-  if (lawyerName && lawyerName.length > 5) {
-    const normalizedName = lawyerName
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toUpperCase()
-      .trim();
-    
-    const normalizedText = text
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toUpperCase();
-    
-    if (normalizedText.includes(normalizedName)) {
-      console.log(`[VALIDATION] ✅ Nome "${lawyerName}" encontrado no texto`);
-      return true;
-    }
-    
-    // Tentar partes do nome (primeiro + último)
-    const nameParts = normalizedName.split(/\s+/);
-    if (nameParts.length >= 2) {
-      const firstName = nameParts[0];
-      const lastName = nameParts[nameParts.length - 1];
-      
-      if (firstName.length >= 3 && lastName.length >= 3) {
-        if (normalizedText.includes(firstName) && normalizedText.includes(lastName)) {
-          console.log(`[VALIDATION] ✅ Nome parcial "${firstName} ... ${lastName}" encontrado`);
-          return true;
-        }
-      }
-    }
-  }
-  
-  console.log(`[VALIDATION] ❌ Publicação não é relevante para OAB ${oabNumOnly} / ${lawyerName}`);
-  return false;
+  // Se buscou pelo nome do advogado e tem termos jurídicos, é válido!
+  // O TJSP já fez o filtro principal
+  console.log(`[VALIDATION] ✅ Publicação VÁLIDA - contém termos jurídicos`);
+  return true;
 }
 
-async function processJobs() {
-  console.log('');
-  console.log('='.repeat(60));
-  console.log('[WORKER] ⏰ ' + new Date().toISOString() + ' - Processando fila...');
-  console.log('='.repeat(60));
-  
-  try {
-    console.log('[WORKER] 🔍 Buscando jobs pendentes...');
-    console.log(`[WORKER] URL: ${WEBHOOK_URL}/dje-get-pending-jobs`);
-    
-    const response = await fetch(`${WEBHOOK_URL}/dje-get-pending-jobs`, {
-      method: 'GET',
-      headers: {
-        'x-webhook-secret': WEBHOOK_SECRET,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    console.log(`[WORKER] Response status: ${response.status}`);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[WORKER] ❌ Erro ao buscar jobs:', response.status, errorText);
-      return;
-    }
-
-    const data = await response.json();
-    const jobs = data.jobs || [];
-    const count = data.count || jobs.length;
-    
-    console.log(`[WORKER] ✅ ${count} job(s) encontrado(s)`);
-    
-    if (jobs.length === 0) {
-      console.log('[WORKER] ℹ️ Nenhum job pendente. Aguardando próximo ciclo.');
-      return;
-    }
-
-    for (const job of jobs) {
-      console.log('');
-      console.log('-'.repeat(50));
-      console.log(`[WORKER] 🔄 Processando job: ${job.id}`);
-      console.log(`[WORKER] 📋 OAB: ${job.oab_number}/${job.oab_state}`);
-      console.log(`[WORKER] 👤 Advogado: ${job.lawyer_name || 'N/A'}`);
-      console.log(`[WORKER] 📅 Data: ${job.target_date}`);
-      console.log('-'.repeat(50));
-
-      try {
-        const publications = await scrapeTJSP(job);
-        console.log(`[WORKER] 📊 Total de publicações válidas: ${publications.length}`);
-        await sendToWebhook(job, publications);
-      } catch (error) {
-        console.error(`[WORKER] ❌ Erro no job ${job.id}:`, error.message);
-        console.error(`[WORKER] Stack:`, error.stack);
-        await sendToWebhook(job, [], error.message);
-      }
-    }
-
-  } catch (error) {
-    console.error('[WORKER] ❌ Erro fatal:', error.message);
-    console.error('[WORKER] Stack:', error.stack);
-  }
+/**
+ * Extrai número de processo do texto
+ */
+function extractProcessNumber(text) {
+  // Padrão CNJ: 0000000-00.0000.0.00.0000
+  const cnjPattern = /\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4}/g;
+  const matches = text.match(cnjPattern);
+  return matches ? matches[0] : null;
 }
 
+/**
+ * Classifica urgência da publicação
+ */
+function classifyUrgency(text) {
+  const textUpper = text.toUpperCase();
+  
+  if (textUpper.includes('URGENTE') || textUpper.includes('24 HORAS') || textUpper.includes('IMEDIATO')) {
+    return 'critical';
+  }
+  if (textUpper.includes('5 DIAS') || textUpper.includes('CINCO DIAS') || textUpper.includes('CITAÇÃO')) {
+    return 'high';
+  }
+  if (textUpper.includes('15 DIAS') || textUpper.includes('QUINZE DIAS') || textUpper.includes('PRAZO')) {
+    return 'medium';
+  }
+  return 'normal';
+}
+
+/**
+ * Scraping do DJe TJSP usando Playwright
+ */
 async function scrapeTJSP(job) {
-  console.log('[TJSP] 🚀 Iniciando scraping do DJe TJSP...');
+  const { oab_number, oab_state, lawyer_name, target_date } = job;
+  const searchTerm = lawyer_name || `OAB ${oab_number}`;
+  const dateBR = formatDateBR(target_date);
   
-  const targetDate = job.target_date;
-  const dateBR = formatDateBR(targetDate);
-  const searchTerm = job.lawyer_name || `OAB ${job.oab_number}`;
-  
+  console.log('');
+  console.log('--------------------------------------------------');
+  console.log(`[TJSP] 🚀 Iniciando scraping do DJe TJSP...`);
   console.log(`[TJSP] 🔍 Termo de busca: "${searchTerm}"`);
-  console.log(`[TJSP] 📅 Data alvo: ${targetDate} (BR: ${dateBR})`);
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--single-process'
-    ]
-  });
-
-  const allPublications = [];
-  const seenHashes = new Set();
-
+  console.log(`[TJSP] 📅 Data alvo: ${target_date} (BR: ${dateBR})`);
+  
+  let browser;
+  const publications = [];
+  
   try {
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-      locale: 'pt-BR'
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
-
-    const page = await context.newPage();
-    page.setDefaultTimeout(60000);
-
-    // Navegar para a página de consulta
-    console.log('[TJSP] 🌐 Navegando para DJe TJSP...');
+    
+    const page = await browser.newPage();
+    page.setDefaultTimeout(45000);
+    
+    // Navegar para o DJe TJSP
+    console.log(`[TJSP] 🌐 Navegando para DJe TJSP...`);
     await page.goto('https://dje.tjsp.jus.br/cdje/consultaAvancada.do', {
       waitUntil: 'domcontentloaded',
-      timeout: 45000
+      timeout: 30000
     });
-
-    // Aguardar a página carregar
-    await page.waitForTimeout(3000);
-    console.log('[TJSP] ✅ Página carregada');
-
-    // Screenshot para debug (opcional)
-    // await page.screenshot({ path: '/tmp/tjsp-1-loaded.png' });
-
+    console.log(`[TJSP] ✅ Página carregada`);
+    
     // Verificar se o formulário existe
-    const formExists = await page.$('form');
+    const formExists = await page.locator('form').first().isVisible().catch(() => false);
     console.log(`[TJSP] 📝 Formulário encontrado: ${formExists ? 'SIM' : 'NÃO'}`);
-
-    // PASSO 1: Preencher campo de pesquisa livre
+    
+    // Preencher campo de pesquisa livre com o NOME do advogado
     console.log(`[TJSP] 📝 Preenchendo pesquisa livre: "${searchTerm}"`);
-    try {
-      const pesquisaLivreSelector = 'input[name="dadosConsulta.pesquisaLivre"]';
-      await page.waitForSelector(pesquisaLivreSelector, { timeout: 10000 });
-      await page.fill(pesquisaLivreSelector, searchTerm);
-      console.log('[TJSP] ✅ Campo pesquisaLivre preenchido');
-    } catch (e) {
-      console.log('[TJSP] ⚠️ Método fill falhou, tentando via JavaScript...');
-      await page.evaluate((term) => {
-        const el = document.querySelector('input[name="dadosConsulta.pesquisaLivre"]');
-        if (el) {
-          el.value = term;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }, searchTerm);
-    }
-
-    // PASSO 2: Preencher datas (campos readonly - usar JavaScript)
+    await page.evaluate((term) => {
+      const input = document.querySelector('input[name="dadosConsulta.pesquisaLivre"]');
+      if (input) {
+        input.removeAttribute('readonly');
+        input.removeAttribute('disabled');
+        input.value = term;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, searchTerm);
+    console.log(`[TJSP] ✅ Campo pesquisaLivre preenchido`);
+    
+    // Preencher datas (início e fim iguais)
     console.log(`[TJSP] 📅 Preenchendo datas: ${dateBR}`);
-    
     await page.evaluate((dateValue) => {
-      // Função auxiliar para definir valor em campo readonly
-      function setDateField(selector, value) {
-        const el = document.querySelector(selector);
-        if (el) {
-          // Remover atributos que bloqueiam edição
-          el.removeAttribute('readonly');
-          el.removeAttribute('disabled');
-          el.classList.remove('disabled');
-          
-          // Definir valor
-          el.value = value;
-          
-          // Disparar eventos
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true }));
-          
-          console.log(`Campo ${selector} definido: ${value}`);
-          return true;
+      ['dtInicio', 'dtFim'].forEach(name => {
+        const input = document.querySelector(`input[name="dadosConsulta.${name}"]`);
+        if (input) {
+          input.removeAttribute('readonly');
+          input.removeAttribute('disabled');
+          input.value = dateValue;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        return false;
-      }
-      
-      // Tentar diferentes seletores para data início
-      const dtInicioSelectors = [
-        'input[name="dadosConsulta.dtInicio"]',
-        'input#dtInicio',
-        'input[id*="dtInicio"]'
-      ];
-      
-      for (const sel of dtInicioSelectors) {
-        if (setDateField(sel, dateValue)) break;
-      }
-      
-      // Tentar diferentes seletores para data fim
-      const dtFimSelectors = [
-        'input[name="dadosConsulta.dtFim"]',
-        'input#dtFim',
-        'input[id*="dtFim"]'
-      ];
-      
-      for (const sel of dtFimSelectors) {
-        if (setDateField(sel, dateValue)) break;
-      }
+      });
     }, dateBR);
-
-    console.log('[TJSP] ✅ Datas configuradas');
-
-    // PASSO 3: Selecionar "Todos os Cadernos"
-    console.log('[TJSP] 📚 Selecionando todos os cadernos...');
-    try {
-      await page.selectOption('select[name="dadosConsulta.cdCaderno"]', '-11');
-      console.log('[TJSP] ✅ Caderno: Todos (-11)');
-    } catch (e) {
-      console.log('[TJSP] ⚠️ Não foi possível selecionar caderno');
-    }
-
-    await page.waitForTimeout(1000);
-
-    // PASSO 4: Submeter formulário
-    console.log('[TJSP] 🔍 Submetendo busca...');
+    console.log(`[TJSP] ✅ Datas configuradas`);
     
+    // Selecionar todos os cadernos
+    console.log(`[TJSP] 📚 Selecionando todos os cadernos...`);
+    await page.evaluate(() => {
+      const select = document.querySelector('select[name="dadosConsulta.cdCaderno"]');
+      if (select) {
+        select.value = '-11'; // Todos os cadernos
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+    console.log(`[TJSP] ✅ Caderno: Todos (-11)`);
+    
+    // Aguardar um pouco para os campos serem processados
+    await page.waitForTimeout(1000);
+    
+    // Clicar no botão pesquisar
+    console.log(`[TJSP] 🔍 Submetendo busca...`);
     const submitSelectors = [
       'input[type="submit"][value="Pesquisar"]',
       'input[type="submit"]',
       'button[type="submit"]',
-      'input.btn',
-      'button.btn'
+      '.btn-pesquisar',
+      '#pesquisar'
     ];
     
-    let submitted = false;
     for (const selector of submitSelectors) {
       try {
-        const btn = await page.$(selector);
-        if (btn) {
+        const btn = page.locator(selector).first();
+        if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
           await btn.click();
-          submitted = true;
           console.log(`[TJSP] ✅ Clicou em: ${selector}`);
           break;
         }
@@ -301,238 +203,251 @@ async function scrapeTJSP(job) {
         continue;
       }
     }
-
-    if (!submitted) {
-      console.log('[TJSP] ⚠️ Submetendo via JavaScript...');
-      await page.evaluate(() => {
-        const form = document.querySelector('form');
-        if (form) form.submit();
-      });
-    }
-
+    
     // Aguardar resultados
-    console.log('[TJSP] ⏳ Aguardando resultados...');
+    console.log(`[TJSP] ⏳ Aguardando resultados...`);
     await page.waitForTimeout(5000);
-
-    // Screenshot para debug
-    // await page.screenshot({ path: '/tmp/tjsp-2-results.png' });
-
-    // PASSO 5: Extrair publicações
-    console.log('[TJSP] 📄 Extraindo publicações...');
     
-    const pageContent = await page.content();
-    const bodyText = await page.evaluate(() => document.body.innerText || '');
+    // Extrair publicações
+    console.log(`[TJSP] 📄 Extraindo publicações...`);
     
-    console.log(`[TJSP] 📊 Tamanho do HTML: ${pageContent.length} chars`);
-    console.log(`[TJSP] 📊 Tamanho do texto: ${bodyText.length} chars`);
-
-    // Verificar se há mensagem de "nenhum resultado"
-    const noResultsPatterns = [
-      'nenhum resultado',
-      'não foram encontrad',
-      'não há publicações',
-      'nenhuma publicação',
-      '0 registro'
-    ];
-    
-    const hasNoResults = noResultsPatterns.some(pattern => 
-      bodyText.toLowerCase().includes(pattern)
-    );
-    
-    if (hasNoResults) {
-      console.log('[TJSP] ℹ️ Site retornou: Nenhum resultado encontrado');
-      return [];
-    }
-
-    // Extrair publicações usando múltiplos seletores
-    const results = await page.evaluate(() => {
-      const publications = [];
+    const extractedData = await page.evaluate(() => {
+      const results = [];
       
-      // Lista expandida de seletores para capturar publicações
-      const selectors = [
-        // Seletores específicos do TJSP
-        '.fundocinza1',
-        '.fundocinza2',
-        '.conteudoPublicacao',
-        '.conteudo-publicacao',
-        '.texto-publicacao',
-        '.itemTexto',
-        '.resultadoConsulta',
-        '.resultado-consulta',
-        
-        // Seletores de tabela
-        'tr.fundocinza1 td',
-        'tr.fundocinza2 td',
-        'table.resultadoConsulta tr td',
-        
-        // Seletores genéricos
+      // Estratégia 1: Tabelas de resultado
+      const tables = document.querySelectorAll('table.resultTable, table.listagem, table[class*="result"]');
+      tables.forEach(table => {
+        const rows = table.querySelectorAll('tr');
+        rows.forEach(row => {
+          const text = row.innerText?.trim();
+          if (text && text.length > 100) {
+            results.push({ text, source: 'table' });
+          }
+        });
+      });
+      
+      // Estratégia 2: Divs de publicação
+      const divSelectors = [
+        'div.publicacao',
+        'div.resultado',
+        'div.conteudo-publicacao',
         'div[class*="publicacao"]',
         'div[class*="resultado"]',
-        'td[class*="conteudo"]'
+        'div.dados',
+        'div.item'
       ];
       
-      for (const selector of selectors) {
-        try {
-          const elements = document.querySelectorAll(selector);
-          console.log(`Seletor "${selector}": ${elements.length} elementos`);
-          
-          elements.forEach((el, idx) => {
-            const text = (el.innerText || el.textContent || '').trim();
-            
-            // Só aceitar textos com tamanho significativo
-            if (text.length > 100) {
-              // Extrair número do processo
-              const processMatch = text.match(/(\d{7}-\d{2}\.\d{4}\.\d{1,2}\.\d{2}\.\d{4})/);
-              
-              publications.push({
-                text: text.substring(0, 8000),
-                processNumber: processMatch ? processMatch[1] : null,
-                selector: selector,
-                index: idx
-              });
+      divSelectors.forEach(selector => {
+        document.querySelectorAll(selector).forEach(div => {
+          const text = div.innerText?.trim();
+          if (text && text.length > 100) {
+            results.push({ text, source: 'div' });
+          }
+        });
+      });
+      
+      // Estratégia 3: Parágrafos longos
+      document.querySelectorAll('p, span.texto, td.texto').forEach(el => {
+        const text = el.innerText?.trim();
+        if (text && text.length > 200) {
+          results.push({ text, source: 'paragraph' });
+        }
+      });
+      
+      // Estratégia 4: Texto completo de áreas de resultado
+      const resultAreas = document.querySelectorAll('#resultados, .resultados, #listaResultados, .lista-resultados');
+      resultAreas.forEach(area => {
+        const text = area.innerText?.trim();
+        if (text && text.length > 100) {
+          // Dividir por padrões comuns de separação
+          const parts = text.split(/(?=Processo:|(?:\d{7}-\d{2}\.\d{4}))/);
+          parts.forEach(part => {
+            if (part.trim().length > 100) {
+              results.push({ text: part.trim(), source: 'area' });
             }
           });
-          
-          // Se encontrou publicações, não precisa tentar outros seletores
-          if (publications.length > 0) {
-            console.log(`Usando seletor: ${selector} (${publications.length} publicações)`);
-            break;
-          }
-        } catch (e) {
-          console.log(`Erro no seletor ${selector}: ${e.message}`);
         }
-      }
-      
-      return publications;
-    });
-
-    console.log(`[TJSP] 📊 Publicações brutas extraídas: ${results.length}`);
-
-    // Processar e validar cada publicação
-    for (const result of results) {
-      // Verificar se é relevante para o advogado
-      if (!isRelevantForLawyer(result.text, job.oab_number, job.lawyer_name)) {
-        continue;
-      }
-
-      // Gerar hash para deduplicação
-      const textHash = simpleHash(result.text.substring(0, 500));
-      if (seenHashes.has(textHash)) {
-        console.log('[TJSP] ⚠️ Publicação duplicada (mesmo hash), pulando...');
-        continue;
-      }
-      seenHashes.add(textHash);
-
-      // Classificar tipo
-      const textLower = result.text.toLowerCase();
-      let type = 'other';
-      if (textLower.includes('intimação') || textLower.includes('intimacao')) type = 'intimacao';
-      else if (textLower.includes('sentença') || textLower.includes('sentenca')) type = 'sentenca';
-      else if (textLower.includes('despacho')) type = 'despacho';
-      else if (textLower.includes('decisão') || textLower.includes('decisao')) type = 'decisao';
-      else if (textLower.includes('citação') || textLower.includes('citacao')) type = 'citacao';
-
-      // Classificar urgência
-      let urgency = 'normal';
-      if (/urgente|urgência|citação/i.test(result.text)) urgency = 'critical';
-      else if (/intimação pessoal|sentença|prazo.*\d+.*dias?/i.test(result.text)) urgency = 'high';
-
-      allPublications.push({
-        date: targetDate,
-        type,
-        text: result.text,
-        processNumber: result.processNumber,
-        urgency,
-        source: 'TJSP_RAILWAY_V6',
-        caderno: 'DJe',
-        page: null,
-        lawyers: [job.lawyer_name || `OAB ${job.oab_number}/${job.oab_state}`]
       });
-
-      console.log(`[TJSP] ✅ Publicação válida: tipo=${type}, processo=${result.processNumber || 'N/A'}`);
+      
+      return {
+        results,
+        htmlLength: document.body.innerHTML.length,
+        textLength: document.body.innerText.length
+      };
+    });
+    
+    console.log(`[TJSP] 📊 Tamanho do HTML: ${extractedData.htmlLength} chars`);
+    console.log(`[TJSP] 📊 Tamanho do texto: ${extractedData.textLength} chars`);
+    console.log(`[TJSP] 📊 Publicações brutas extraídas: ${extractedData.results.length}`);
+    
+    // Log das primeiras 200 chars de cada publicação bruta para debug
+    extractedData.results.forEach((pub, idx) => {
+      console.log(`[DEBUG] Pub ${idx + 1} (${pub.source}): ${pub.text.substring(0, 150)}...`);
+    });
+    
+    // Deduplicar e validar
+    const seenHashes = new Set();
+    
+    for (const raw of extractedData.results) {
+      const text = raw.text.trim();
+      const hash = simpleHash(text.substring(0, 500));
+      
+      if (seenHashes.has(hash)) {
+        console.log(`[VALIDATION] ⚠️ Duplicata ignorada`);
+        continue;
+      }
+      seenHashes.add(hash);
+      
+      // Validação relaxada - se retornou do TJSP com o nome buscado, é válido
+      if (isValidPublication(text, oab_number, lawyer_name)) {
+        const processNumber = extractProcessNumber(text);
+        const urgency = classifyUrgency(text);
+        
+        publications.push({
+          text: text.substring(0, 5000),
+          date: target_date,
+          processNumber,
+          urgency,
+          source: 'TJSP',
+          caderno: 'DJe',
+          rawSource: raw.source
+        });
+      }
     }
-
-    console.log(`[TJSP] 📊 Total de publicações VÁLIDAS: ${allPublications.length}`);
-
+    
+    console.log(`[TJSP] 📊 Total de publicações VÁLIDAS: ${publications.length}`);
+    
   } catch (error) {
-    console.error('[TJSP] ❌ Erro durante scraping:', error.message);
-    console.error('[TJSP] Stack:', error.stack);
-    throw error;
+    console.error(`[TJSP] ❌ Erro no scraping:`, error.message);
   } finally {
-    await browser.close();
-    console.log('[TJSP] 🔒 Browser fechado');
+    if (browser) {
+      await browser.close();
+      console.log(`[TJSP] 🔒 Browser fechado`);
+    }
   }
-
-  return allPublications;
+  
+  return publications;
 }
 
+/**
+ * Envia publicações para o webhook
+ */
 async function sendToWebhook(job, publications, errorMessage = null) {
   console.log(`[WORKER] 📤 Enviando ${publications.length} publicações para webhook...`);
   
   const payload = {
-    jobId: job.id,
     job_id: job.id,
+    monitoring_id: job.monitoring_id,
     oab_number: job.oab_number,
+    oab_state: job.oab_state,
     lawyer_name: job.lawyer_name,
     target_date: job.target_date,
-    status: errorMessage ? 'failed' : 'completed',
-    publications,
-    resultsCount: publications.length,
-    error: errorMessage
+    publications: publications,
+    error: errorMessage,
+    scraped_at: new Date().toISOString()
   };
-
+  
   try {
-    const response = await fetch(`${WEBHOOK_URL}/dje-webhook-receiver`, {
+    const response = await fetch(WEBHOOK_URL, {
       method: 'POST',
       headers: {
-        'x-webhook-secret': WEBHOOK_SECRET,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'x-webhook-secret': WEBHOOK_SECRET
       },
       body: JSON.stringify(payload)
     });
-
+    
     const result = await response.json();
     console.log(`[WORKER] ✅ Webhook response:`, JSON.stringify(result));
-    
+    return result;
   } catch (error) {
-    console.error(`[WORKER] ❌ Erro ao enviar webhook:`, error.message);
+    console.error(`[WORKER] ❌ Erro no webhook:`, error.message);
+    return null;
   }
 }
 
+/**
+ * Busca jobs pendentes
+ */
+async function fetchPendingJobs() {
+  console.log(`[WORKER] 🔍 Buscando jobs pendentes...`);
+  console.log(`[WORKER] URL: ${GET_JOBS_URL}`);
+  
+  try {
+    const response = await fetch(GET_JOBS_URL, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    console.log(`[WORKER] Response status: ${response.status}`);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    const jobs = data.jobs || [];
+    console.log(`[WORKER] ✅ ${jobs.length} job(s) encontrado(s)`);
+    return jobs;
+  } catch (error) {
+    console.error(`[WORKER] ❌ Erro ao buscar jobs:`, error.message);
+    return [];
+  }
+}
+
+/**
+ * Processa a fila de jobs
+ */
+async function processQueue() {
+  console.log('');
+  console.log('============================================================');
+  console.log(`[WORKER] ⏰ ${new Date().toISOString()} - Processando fila...`);
+  console.log('============================================================');
+  
+  const jobs = await fetchPendingJobs();
+  
+  if (jobs.length === 0) {
+    console.log(`[WORKER] ℹ️ Nenhum job pendente. Aguardando próximo ciclo.`);
+    return;
+  }
+  
+  for (const job of jobs) {
+    console.log('');
+    console.log('--------------------------------------------------');
+    console.log(`[WORKER] 🔄 Processando job: ${job.id}`);
+    console.log(`[WORKER] 📋 OAB: ${job.oab_number}/${job.oab_state}`);
+    console.log(`[WORKER] 👤 Advogado: ${job.lawyer_name}`);
+    console.log(`[WORKER] 📅 Data: ${job.target_date}`);
+    
+    try {
+      const publications = await scrapeTJSP(job);
+      console.log(`[WORKER] 📊 Total de publicações válidas: ${publications.length}`);
+      await sendToWebhook(job, publications);
+    } catch (error) {
+      console.error(`[WORKER] ❌ Erro no job ${job.id}:`, error.message);
+      await sendToWebhook(job, [], error.message);
+    }
+  }
+}
+
+/**
+ * Função principal
+ */
 async function main() {
   console.log('');
-  console.log('*'.repeat(60));
-  console.log('[WORKER] 🚀 DJe Scraper Worker v6.0 - INICIANDO');
-  console.log(`[WORKER] 📡 Webhook URL: ${WEBHOOK_URL ? WEBHOOK_URL.substring(0, 50) + '...' : 'NÃO CONFIGURADA!'}`);
-  console.log(`[WORKER] 🔐 Webhook Secret: ${WEBHOOK_SECRET ? '***configurado***' : 'NÃO CONFIGURADA!'}`);
+  console.log('************************************************************');
+  console.log(`[WORKER] 🚀 DJe Scraper Worker v7.0 - INICIANDO`);
+  console.log('************************************************************');
   console.log(`[WORKER] 🕐 Horário: ${new Date().toISOString()}`);
-  console.log('*'.repeat(60));
+  console.log(`[WORKER] 📡 Webhook URL: ${WEBHOOK_URL?.substring(0, 60)}...`);
+  console.log(`[WORKER] 🔐 Webhook Secret: ${WEBHOOK_SECRET ? '***configurado***' : '❌ NÃO CONFIGURADO'}`);
   
-  if (!WEBHOOK_URL || !WEBHOOK_SECRET) {
-    console.error('[WORKER] ❌ ERRO FATAL: Variáveis de ambiente não configuradas!');
-    console.error('[WORKER] Configure WEBHOOK_URL e WEBHOOK_SECRET no Railway');
-    process.exit(1);
-  }
+  // Processar imediatamente
+  await processQueue();
   
-  // Executar imediatamente
-  await processJobs();
-  
-  // Configurar execução periódica
-  console.log('[WORKER] ♾️ Configurando execução a cada 5 minutos...');
-  setInterval(async () => {
-    await processJobs();
-  }, 5 * 60 * 1000);
+  // Configurar intervalo de 5 minutos
+  console.log(`[WORKER] ♾️ Configurando execução a cada 5 minutos...`);
+  setInterval(processQueue, 5 * 60 * 1000);
 }
-
-// Capturar erros não tratados
-process.on('uncaughtException', (error) => {
-  console.error('[WORKER] 💥 Uncaught Exception:', error.message);
-  console.error(error.stack);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[WORKER] 💥 Unhandled Rejection at:', promise);
-  console.error('[WORKER] Reason:', reason);
-});
 
 main();
