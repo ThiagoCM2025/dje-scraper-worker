@@ -1,11 +1,11 @@
-FROM mcr.microsoft.com/playwright:v1.55.1-jammy
+FROM mcr.microsoft.com/playwright:v1.55.1-noble
 
 WORKDIR /app
 
-COPY package.json ./
+COPY package*.json ./
 
-RUN npm install --omit=dev
+RUN npm ci --only=production
 
 COPY . .
 
-CMD ["node", "src/index.js"]
+CMD ["npm", "start"]
